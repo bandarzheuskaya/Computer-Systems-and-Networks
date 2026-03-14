@@ -1,13 +1,16 @@
 import socket
 import argparse
 import struct
-from time import perf_counter
+from time import perf_counter, sleep
 import os
 
 ICMP_ID = os.getpid() & 0xFFFF
 MAX_HOPS = 30
 PROBES_PER_HOP = 3
 TIMEOUT = 3
+
+PRINT_DELAY = 0.3
+HOST_DELAY = 0.4
 
 
 class ICMPPacketCreator:
@@ -105,11 +108,13 @@ def send_probe(target_ip, ttl, seq):
     s = create_socket(ttl)
     try:
         pack = ICMPPacketCreator(target_ip, port=None, icmp_id=ICMP_ID).create_icmp_packet(seq)
-        sec1 = perf_counter()
+
+        start = perf_counter()
         s.sendto(pack, (target_ip, 0))
         data, addr = s.recvfrom(65468)
-        sec2 = perf_counter()
-        return data, addr, (sec2 - sec1) * 1000
+        end = perf_counter()
+
+        return data, addr, (end - start) * 1000
     except socket.timeout:
         return None, None, None
     finally:
@@ -119,12 +124,15 @@ def send_probe(target_ip, ttl, seq):
 def parse_icmp_header(data):
     ip_header_len = (data[0] & 0x0F) * 4
     icmp_header = data[ip_header_len:ip_header_len + 8]
+
     icmp_type, icmp_code, checksum, packet_id, sequence = struct.unpack("!BBHHH", icmp_header)
+
     return icmp_type, icmp_code, packet_id, sequence, ip_header_len
 
 
 def check_echo_reply(data, expected_id, expected_seq):
     icmp_type, icmp_code, packet_id, packet_sequence, _ = parse_icmp_header(data)
+
     return icmp_type == 0 and packet_id == expected_id and packet_sequence == expected_seq
 
 
@@ -142,6 +150,7 @@ def check_time_exceeded(data, expected_id, expected_seq):
 
     inner_icmp_start = inner_ip_start + inner_ip_header_len
     inner_icmp_header = data[inner_icmp_start:inner_icmp_start + 8]
+
     inner_type, inner_code, _, inner_id, inner_seq = struct.unpack("!BBHHH", inner_icmp_header)
 
     return inner_type == 8 and inner_id == expected_id and inner_seq == expected_seq
@@ -153,56 +162,79 @@ def trace_hop(target_ip, ttl, seq):
     last_valid_seq = None
 
     for _ in range(PROBES_PER_HOP):
+
         seq += 1
+
         data, addr, rtt_ms = send_probe(target_ip, ttl, seq)
 
         if rtt_ms is None:
-            print('*'.center(10, ' '), end='')
+            print('*'.center(10), end='', flush=True)
+            sleep(PRINT_DELAY)
             continue
 
         is_echo_reply = check_echo_reply(data, ICMP_ID, seq)
         is_time_exceeded = check_time_exceeded(data, ICMP_ID, seq)
 
         if is_echo_reply or is_time_exceeded:
+
             if rtt_ms < 1:
-                print("<1 ms".center(10, ' '), end='')
+                print("<1 ms".center(10), end='', flush=True)
             else:
-                print(f"{rtt_ms:.0f} ms".center(10, ' '), end='')
+                print(f"{rtt_ms:.0f} ms".center(10), end='', flush=True)
+
             last_valid_data = data
             last_valid_addr = addr
             last_valid_seq = seq
+
         else:
-            print('*'.center(10, ' '), end='')
+            print('*'.center(10), end='', flush=True)
+
+        sleep(PRINT_DELAY)
 
     return last_valid_data, last_valid_addr, seq, last_valid_seq
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    '-r',
-    action='store_true',
-    help='resolve route node IP addresses to hostnames using reverse DNS'
-)
-parser.add_argument('target', type=str, help='host to trace route to')
-args = parser.parse_args()
+def main():
 
-target_ip = resolve_target(args.target)
+    parser = argparse.ArgumentParser()
 
-print(f"Tracing route to {format_target_header(args.target, target_ip, args.r)}")
-print(f"over a maximum of {MAX_HOPS} hops:\n")
+    parser.add_argument(
+        '-r',
+        action='store_true',
+        help='resolve route node IP addresses to hostnames using reverse DNS'
+    )
 
-seq = 0
+    parser.add_argument('target', type=str)
 
-for ttl in range(1, MAX_HOPS + 1):
-    print(f"{ttl}".center(7, ' '), end='')
+    args = parser.parse_args()
 
-    data, addr, seq, last_seq = trace_hop(target_ip, ttl, seq)
+    target_ip = resolve_target(args.target)
 
-    if addr is not None and data is not None and last_seq is not None:
-        print(format_host(addr[0], args.r))
+    print(f"\nTracing route to {format_target_header(args.target, target_ip, args.r)}")
+    print(f"over a maximum of {MAX_HOPS} hops:\n")
 
-        if check_echo_reply(data, ICMP_ID, last_seq):
-            print('\nTrace complete.')
-            break
-    else:
-        print('Request timed out.')
+    seq = 0
+
+    for ttl in range(1, MAX_HOPS + 1):
+
+        print(f"{ttl}".center(7), end='', flush=True)
+
+        data, addr, seq, last_seq = trace_hop(target_ip, ttl, seq)
+
+        sleep(HOST_DELAY)
+
+        if addr is not None and data is not None and last_seq is not None:
+
+            print(format_host(addr[0], args.r))
+
+            if check_echo_reply(data, ICMP_ID, last_seq):
+
+                print('\nTrace complete.')
+                break
+
+        else:
+            print("Request timed out.")
+
+
+if __name__ == "__main__":
+    main()

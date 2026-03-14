@@ -69,7 +69,16 @@ class ICMPPacketCreator:
 
 
 def resolve_target(target):
-    return socket.getaddrinfo(target, None, family=socket.AF_INET)[0][4][0]
+    try:
+        return socket.getaddrinfo(
+            target,
+            None,
+            family=socket.AF_INET
+        )[0][4][0]
+
+    except socket.gaierror:
+        print(f"Unable to resolve target system name {target}.")
+        exit(1)
 
 
 def format_host(ip, resolve_names=False):

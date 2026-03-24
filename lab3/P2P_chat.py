@@ -17,6 +17,7 @@ HEADER_FORMAT = "!BI"   # 1 byte type, 4 bytes payload length
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 HELLO_INTERVAL = 2.0
+KEEPALIVE_INTERVAL = 5.0
 SOCKET_TIMEOUT = 5.0
 
 
@@ -28,18 +29,20 @@ class MessageType(IntEnum):
     NAME = 2
     HELLO = 3
     DISCONNECT = 4
+    KEEPALIVE = 5
 
 
 # =========================
 # Вспомогательные структуры
 # =========================
 class Peer:
-    def __init__(self, ip, name="", sock=None, connected=False, reader_thread=None):
+    def __init__(self, ip, name="", sock=None, connected=False, reader_thread=None, keepalive_thread=None):
         self.ip = ip
         self.name = name
         self.sock = sock
         self.connected = connected
         self.reader_thread = reader_thread
+        self.keepalive_thread = keepalive_thread
 
 
 class HistoryEvent:
@@ -291,15 +294,42 @@ class P2PChatApp:
                 content=f"Получен HELLO от {sender_name} ({sender_ip})"
             )
 
-            # В этой версии каждый узел пытается подключиться сам.
-            # Дубликаты соединений отсекаются проверками.
-            if not already_connected:
-                connect_thread = threading.Thread(
-                    target=self.connect_to_peer,
-                    args=(sender_ip, sender_name),
-                    daemon=True
-                )
-                connect_thread.start()
+            # TCP инициирует только узел с меньшим IP.
+            # Это делает поведение чище и понятнее в Wireshark.
+            if not already_connected and self.ip < sender_ip:
+                self.connect_to_peer(sender_ip, sender_name)
+
+    # -------------------------
+    # KEEPALIVE
+    # -------------------------
+    def keepalive_loop(self, peer_ip, peer_sock):
+        while self.running:
+            with self.peers_lock:
+                if peer_ip not in self.peers:
+                    break
+                if not self.peers[peer_ip].connected:
+                    break
+                if self.peers[peer_ip].sock is not peer_sock:
+                    break
+
+            try:
+                peer_sock.sendall(create_message(MessageType.KEEPALIVE, "ping"))
+            except OSError:
+                break
+
+            time.sleep(KEEPALIVE_INTERVAL)
+
+    def start_keepalive(self, peer_ip, peer_sock):
+        keepalive_thread = threading.Thread(
+            target=self.keepalive_loop,
+            args=(peer_ip, peer_sock),
+            daemon=True
+        )
+        keepalive_thread.start()
+
+        with self.peers_lock:
+            if peer_ip in self.peers:
+                self.peers[peer_ip].keepalive_thread = keepalive_thread
 
     # -------------------------
     # TCP: исходящее подключение
@@ -324,9 +354,17 @@ class P2PChatApp:
             tcp_sock.connect((peer_ip, TCP_PORT))
             tcp_sock.settimeout(None)
 
+            # Небольшая задержка, чтобы handshake и дальнейший обмен было проще увидеть в Wireshark
+            time.sleep(0.5)
+
             self.add_history_event(
                 event_type="system",
                 content=f"TCP connect успешно выполнен к {peer_ip}:{TCP_PORT}"
+            )
+
+            self.add_history_event(
+                event_type="system",
+                content=f"TCP сокет открыт: local={tcp_sock.getsockname()}, remote={tcp_sock.getpeername()}"
             )
 
             tcp_sock.sendall(create_message(MessageType.NAME, self.name))
@@ -346,8 +384,6 @@ class P2PChatApp:
             peer.reader_thread = reader_thread
 
             with self.peers_lock:
-                # Если пока мы подключались, peer уже стал connected через входящее соединение,
-                # дубликат закрываем.
                 if peer_ip in self.peers and self.peers[peer_ip].connected:
                     tcp_sock.close()
                     return
@@ -361,6 +397,7 @@ class P2PChatApp:
             )
 
             reader_thread.start()
+            self.start_keepalive(peer_ip, tcp_sock)
 
         except OSError as e:
             self.add_history_event(
@@ -403,6 +440,11 @@ class P2PChatApp:
         self.add_history_event(
             event_type="system",
             content=f"Принято входящее TCP-соединение от {peer_ip}"
+        )
+
+        self.add_history_event(
+            event_type="system",
+            content=f"Принят TCP сокет: local={peer_sock.getsockname()}, remote={peer_sock.getpeername()}"
         )
 
         try:
@@ -448,6 +490,7 @@ class P2PChatApp:
             )
 
             reader_thread.start()
+            self.start_keepalive(peer_ip, peer_sock)
 
         except (ConnectionError, OSError) as e:
             self.add_history_event(
@@ -477,6 +520,10 @@ class P2PChatApp:
                         peer_name=actual_name,
                         content=payload
                     )
+
+                elif msg_type == MessageType.KEEPALIVE:
+                    # Не выводим keepalive в чат
+                    continue
 
                 elif msg_type == MessageType.DISCONNECT:
                     with self.peers_lock:
@@ -565,6 +612,7 @@ class P2PChatApp:
                 self.peers[peer_ip].connected = False
                 self.peers[peer_ip].sock = None
                 self.peers[peer_ip].reader_thread = None
+                self.peers[peer_ip].keepalive_thread = None
 
     def shutdown(self):
         self.running = False

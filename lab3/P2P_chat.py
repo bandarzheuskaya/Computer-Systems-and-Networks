@@ -13,7 +13,7 @@ UDP_PORT = 4242
 TCP_PORT = 4243
 BUFFER_SIZE = 4096
 
-HEADER_FORMAT = "!BI"
+HEADER_FORMAT = "!BI"   # 1 byte type, 4 bytes payload length
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 HELLO_INTERVAL = 2.0
@@ -52,17 +52,21 @@ class HistoryEvent:
 
     def format_for_display(self):
         if self.event_type == "peer_discovered":
-            return f"[{self.timestamp}] SYSTEM: обнаружен узел {self.peer_name} ({self.peer_ip})"
+            return f"[{self.timestamp}] [INFO] Обнаружен узел: {self.peer_name} ({self.peer_ip})"
         if self.event_type == "peer_connected":
-            return f"[{self.timestamp}] SYSTEM: соединение установлено с {self.peer_name} ({self.peer_ip})"
+            return f"[{self.timestamp}] [INFO] Установлено соединение с: {self.peer_name} ({self.peer_ip})"
         if self.event_type == "incoming_message":
-            return f"[{self.timestamp}] {self.peer_name}@{self.peer_ip}: {self.content}"
+            return f"[{self.timestamp}] [CHAT] {self.peer_name} ({self.peer_ip}): {self.content}"
         if self.event_type == "outgoing_message":
-            return f"[{self.timestamp}] you: {self.content}"
+            return f"[{self.timestamp}] [CHAT] Вы: {self.content}"
         if self.event_type == "peer_disconnected":
-            return f"[{self.timestamp}] SYSTEM: узел отключился {self.peer_name} ({self.peer_ip})"
+            return f"[{self.timestamp}] [INFO] Узел отключился: {self.peer_name} ({self.peer_ip})"
         if self.event_type == "system":
-            return f"[{self.timestamp}] SYSTEM: {self.content}"
+            return f"[{self.timestamp}] [INFO] {self.content}"
+        if self.event_type == "warn":
+            return f"[{self.timestamp}] [WARN] {self.content}"
+        if self.event_type == "error":
+            return f"[{self.timestamp}] [ERROR] {self.content}"
         return f"[{self.timestamp}] {self.content}"
 
 
@@ -70,6 +74,7 @@ class HistoryEvent:
 # Протокол
 # =========================
 def create_message(msg_type, payload_text=""):
+    msg_type = MessageType(msg_type)
     payload = payload_text.encode("utf-8")
     header = struct.pack(HEADER_FORMAT, int(msg_type), len(payload))
     return header + payload
@@ -171,7 +176,7 @@ class P2PChatApp:
 
         self.running = False
 
-        self.peers = {}
+        self.peers = {}       # ip -> Peer
         self.history = []
 
         self.peers_lock = threading.Lock()
@@ -223,8 +228,8 @@ class P2PChatApp:
         for broadcast_ip in self.broadcast_addresses:
             try:
                 self.udp_socket.sendto(msg, (broadcast_ip, UDP_PORT))
-            except OSError:
-                pass
+            except OSError as e:
+                self.add_history_event("warn", content=f"Ошибка отправки HELLO на {broadcast_ip}: {e}")
 
     def hello_sender_loop(self):
         while self.running:
@@ -281,9 +286,20 @@ class P2PChatApp:
                     peer_name=sender_name
                 )
 
-            # Подключается узел с меньшим IP, чтобы не было двух TCP-соединений сразу
-            if not already_connected and self.ip < sender_ip:
-                self.connect_to_peer(sender_ip, sender_name)
+            self.add_history_event(
+                event_type="system",
+                content=f"Получен HELLO от {sender_name} ({sender_ip})"
+            )
+
+            # В этой версии каждый узел пытается подключиться сам.
+            # Дубликаты соединений отсекаются проверками.
+            if not already_connected:
+                connect_thread = threading.Thread(
+                    target=self.connect_to_peer,
+                    args=(sender_ip, sender_name),
+                    daemon=True
+                )
+                connect_thread.start()
 
     # -------------------------
     # TCP: исходящее подключение
@@ -296,12 +312,22 @@ class P2PChatApp:
             if peer_ip in self.peers and self.peers[peer_ip].connected:
                 return
 
+        self.add_history_event(
+            event_type="system",
+            content=f"Попытка TCP-подключения к {peer_name or peer_ip} ({peer_ip}:{TCP_PORT})"
+        )
+
         tcp_sock = None
         try:
             tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             tcp_sock.settimeout(SOCKET_TIMEOUT)
             tcp_sock.connect((peer_ip, TCP_PORT))
             tcp_sock.settimeout(None)
+
+            self.add_history_event(
+                event_type="system",
+                content=f"TCP connect успешно выполнен к {peer_ip}:{TCP_PORT}"
+            )
 
             tcp_sock.sendall(create_message(MessageType.NAME, self.name))
 
@@ -320,6 +346,12 @@ class P2PChatApp:
             peer.reader_thread = reader_thread
 
             with self.peers_lock:
+                # Если пока мы подключались, peer уже стал connected через входящее соединение,
+                # дубликат закрываем.
+                if peer_ip in self.peers and self.peers[peer_ip].connected:
+                    tcp_sock.close()
+                    return
+
                 self.peers[peer_ip] = peer
 
             self.add_history_event(
@@ -332,8 +364,8 @@ class P2PChatApp:
 
         except OSError as e:
             self.add_history_event(
-                event_type="system",
-                content=f"ошибка подключения к {peer_ip}: {e}"
+                event_type="warn",
+                content=f"Не удалось подключиться к {peer_name or peer_ip} ({peer_ip}:{TCP_PORT}): {e}"
             )
             if tcp_sock is not None:
                 try:
@@ -368,6 +400,11 @@ class P2PChatApp:
                 pass
             return
 
+        self.add_history_event(
+            event_type="system",
+            content=f"Принято входящее TCP-соединение от {peer_ip}"
+        )
+
         try:
             peer_sock.settimeout(SOCKET_TIMEOUT)
             msg_type, payload = read_message(peer_sock)
@@ -378,6 +415,11 @@ class P2PChatApp:
                 return
 
             peer_name = payload or peer_ip
+
+            self.add_history_event(
+                event_type="system",
+                content=f"По TCP получено имя узла {peer_name} от {peer_ip}"
+            )
 
             with self.peers_lock:
                 if peer_ip in self.peers and self.peers[peer_ip].connected:
@@ -407,7 +449,11 @@ class P2PChatApp:
 
             reader_thread.start()
 
-        except (ConnectionError, OSError):
+        except (ConnectionError, OSError) as e:
+            self.add_history_event(
+                event_type="warn",
+                content=f"Ошибка обработки входящего TCP-соединения от {peer_ip}: {e}"
+            )
             try:
                 peer_sock.close()
             except OSError:
@@ -468,24 +514,22 @@ class P2PChatApp:
             peers_copy = list(self.peers.values())
 
         connected = [p for p in peers_copy if p.connected]
-        discovered = [p for p in peers_copy if not p.connected]
+        disconnected = [p for p in peers_copy if not p.connected]
 
         if not peers_copy:
-            self.add_history_event(event_type="system", content="узлы не найдены")
+            self.add_history_event(event_type="system", content="Узлы не обнаружены")
             return
 
-        if connected:
-            self.add_history_event(event_type="system", content="подключённые узлы:")
-            for peer in connected:
-                print(f"    {peer.name} ({peer.ip})")
+        self.add_history_event(event_type="system", content="Список узлов:")
 
-        if discovered:
-            self.add_history_event(event_type="system", content="обнаруженные, но не подключённые узлы:")
-            for peer in discovered:
-                print(f"    {peer.name} ({peer.ip})")
+        for peer in connected:
+            print(f"    [CONNECTED] {peer.name} ({peer.ip})")
+
+        for peer in disconnected:
+            print(f"    [SEEN]      {peer.name} ({peer.ip})")
 
     # -------------------------
-    # Отправка сообщений
+    # Отправка сообщений всем
     # -------------------------
     def broadcast_chat_message(self, text):
         with self.peers_lock:
@@ -508,8 +552,8 @@ class P2PChatApp:
             )
         else:
             self.add_history_event(
-                event_type="system",
-                content="нет подключённых узлов для отправки сообщения"
+                event_type="warn",
+                content="Нет подключённых узлов для отправки сообщения"
             )
 
     # -------------------------
@@ -554,6 +598,8 @@ class P2PChatApp:
             except OSError:
                 pass
 
+        self.add_history_event(event_type="system", content="Чат остановлен")
+
     # -------------------------
     # Запуск
     # -------------------------
@@ -571,10 +617,22 @@ class P2PChatApp:
         tcp_thread.start()
         hello_thread.start()
 
-        self.add_history_event(event_type="system", content=f"чат запущен, имя={self.name}, основной IP={self.ip}")
-        self.add_history_event(event_type="system", content=f"локальные IP: {', '.join(self.local_ips)}")
-        self.add_history_event(event_type="system", content=f"broadcast адреса: {', '.join(self.broadcast_addresses)}")
-        self.add_history_event(event_type="system", content="команды: /peers, /exit")
+        self.add_history_event(
+            event_type="system",
+            content=f"Чат запущен. Имя: {self.name}, основной IP: {self.ip}"
+        )
+        self.add_history_event(
+            event_type="system",
+            content=f"Все локальные IP: {', '.join(self.local_ips)}"
+        )
+        self.add_history_event(
+            event_type="system",
+            content=f"Broadcast-адреса: {', '.join(self.broadcast_addresses)}"
+        )
+        self.add_history_event(
+            event_type="system",
+            content="Команды: /peers, /exit"
+        )
 
 
 # =========================

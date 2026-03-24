@@ -13,7 +13,7 @@ UDP_PORT = 4242
 TCP_PORT = 4243
 BUFFER_SIZE = 4096
 
-HEADER_FORMAT = "!BI"   # 1 byte type, 4 bytes payload length
+HEADER_FORMAT = "!BI"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 HELLO_INTERVAL = 2.0
@@ -101,18 +101,47 @@ def read_message(sock):
 
 
 # =========================
-# Определение локального IP
+# Определение локальных IP
 # =========================
-def get_local_ip():
-    test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def get_all_local_ips():
+    ips = {"127.0.0.1"}
+
     try:
-        test_sock.connect(("8.8.8.8", 80))
-        ip = test_sock.getsockname()[0]
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            ips.add(ip)
     except OSError:
-        ip = "127.0.0.1"
-    finally:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            ips.add(ip)
+    except OSError:
+        pass
+
+    try:
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        test_sock.connect(("8.8.8.8", 80))
+        ips.add(test_sock.getsockname()[0])
         test_sock.close()
-    return ip
+    except OSError:
+        pass
+
+    return ips
+
+
+def choose_primary_ip(local_ips):
+    for ip in local_ips:
+        if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+            if ip != "127.0.0.1":
+                return ip
+
+    for ip in local_ips:
+        if ip != "127.0.0.1":
+            return ip
+
+    return "127.0.0.1"
 
 
 # =========================
@@ -121,11 +150,13 @@ def get_local_ip():
 class P2PChatApp:
     def __init__(self, name):
         self.name = name
-        self.ip = get_local_ip()
+
+        self.local_ips = get_all_local_ips()
+        self.ip = choose_primary_ip(self.local_ips)
 
         self.running = False
 
-        self.peers = {}       # ip -> Peer
+        self.peers = {}
         self.history = []
 
         self.peers_lock = threading.Lock()
@@ -192,7 +223,7 @@ class P2PChatApp:
 
             sender_ip = addr[0]
 
-            if sender_ip == self.ip:
+            if sender_ip in self.local_ips:
                 continue
 
             if len(data) < HEADER_SIZE:
@@ -233,8 +264,6 @@ class P2PChatApp:
                     peer_name=sender_name
                 )
 
-            # Чтобы не было двух одновременных TCP-соединений,
-            # подключается только узел с меньшим IP
             if not already_connected and self.ip < sender_ip:
                 self.connect_to_peer(sender_ip, sender_name)
 
@@ -242,7 +271,7 @@ class P2PChatApp:
     # TCP: исходящее подключение
     # -------------------------
     def connect_to_peer(self, peer_ip, peer_name=""):
-        if peer_ip == self.ip:
+        if peer_ip in self.local_ips:
             return
 
         with self.peers_lock:
@@ -311,6 +340,13 @@ class P2PChatApp:
     def handle_incoming_connection(self, peer_sock, peer_addr):
         peer_ip = peer_addr[0]
 
+        if peer_ip in self.local_ips:
+            try:
+                peer_sock.close()
+            except OSError:
+                pass
+            return
+
         try:
             peer_sock.settimeout(SOCKET_TIMEOUT)
             msg_type, payload = read_message(peer_sock)
@@ -357,7 +393,7 @@ class P2PChatApp:
                 pass
 
     # -------------------------
-    # Общий цикл чтения TCP-сообщений
+    # Чтение TCP-сообщений
     # -------------------------
     def peer_reader_loop(self, peer_ip, peer_sock, peer_name=""):
         try:
@@ -386,17 +422,7 @@ class P2PChatApp:
                     )
                     break
 
-        except ConnectionError:
-            if self.running:
-                with self.peers_lock:
-                    actual_name = self.peers[peer_ip].name if peer_ip in self.peers else peer_name
-
-                self.add_history_event(
-                    event_type="peer_disconnected",
-                    peer_ip=peer_ip,
-                    peer_name=actual_name
-                )
-        except OSError:
+        except (ConnectionError, OSError):
             if self.running:
                 with self.peers_lock:
                     actual_name = self.peers[peer_ip].name if peer_ip in self.peers else peer_name
@@ -414,7 +440,7 @@ class P2PChatApp:
                 pass
 
     # -------------------------
-    # Отправка сообщений всем
+    # Отправка сообщений
     # -------------------------
     def broadcast_chat_message(self, text):
         with self.peers_lock:
@@ -497,7 +523,8 @@ class P2PChatApp:
         tcp_thread.start()
         hello_thread.start()
 
-        print(f"Чат запущен. Имя: {self.name}, IP: {self.ip}")
+        print(f"Чат запущен. Имя: {self.name}, основной IP: {self.ip}")
+        print(f"Все локальные IP: {', '.join(sorted(self.local_ips))}")
         print("Введите сообщение и нажмите Enter. Для выхода: /exit")
 
 

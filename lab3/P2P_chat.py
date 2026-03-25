@@ -1,3 +1,4 @@
+import argparse
 import socket
 import struct
 import threading
@@ -6,9 +7,6 @@ from datetime import datetime
 from enum import IntEnum
 
 
-# =========================
-# Константы
-# =========================
 UDP_PORT = 4242
 TCP_PORT = 4243
 BUFFER_SIZE = 4096
@@ -16,16 +14,10 @@ BUFFER_SIZE = 4096
 HEADER_FORMAT = "!BI"   # 1 байт тип, 4 байта длина payload
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
+HELLO_INTERVAL = 2.0
 SOCKET_TIMEOUT = 5.0
 
-# Вместо бесконечных HELLO – короткая стартовая серия
-HELLO_BURST_COUNT = 5
-HELLO_BURST_DELAY = 0.4
 
-
-# =========================
-# Типы сообщений
-# =========================
 class MessageType(IntEnum):
     CHAT = 1
     NAME = 2
@@ -33,9 +25,6 @@ class MessageType(IntEnum):
     DISCONNECT = 4
 
 
-# =========================
-# Структуры
-# =========================
 class Peer:
     def __init__(self, ip, name="", sock=None, connected=False, reader_thread=None, source=None):
         self.ip = ip
@@ -74,9 +63,6 @@ class HistoryEvent:
         return f"[{self.timestamp}] {self.content}"
 
 
-# =========================
-# Протокол
-# =========================
 def create_message(msg_type, payload_text=""):
     payload = payload_text.encode("utf-8")
     header = struct.pack(HEADER_FORMAT, int(msg_type), len(payload))
@@ -109,72 +95,15 @@ def read_message(sock):
     return msg_type, payload.decode("utf-8")
 
 
-# =========================
-# Сетевые утилиты
-# =========================
-def get_all_local_ips():
-    ips = {"127.0.0.1"}
-
-    try:
-        hostname = socket.gethostname()
-        for ip in socket.gethostbyname_ex(hostname)[2]:
-            ips.add(ip)
-    except OSError:
-        pass
-
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.add(info[4][0])
-    except OSError:
-        pass
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ips.add(s.getsockname()[0])
-        s.close()
-    except OSError:
-        pass
-
-    return sorted(ip for ip in ips if ip.count(".") == 3)
-
-
-def choose_display_ip(local_ips):
-    for ip in local_ips:
-        if ip != "127.0.0.1":
-            return ip
-    return "127.0.0.1"
-
-
-def derive_broadcasts_from_all_ips(local_ips):
-    broadcasts = {"255.255.255.255"}
-
-    for ip in local_ips:
-        if ip == "127.0.0.1":
-            continue
-
-        parts = ip.split(".")
-        if len(parts) == 4:
-            broadcasts.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
-
-    return sorted(broadcasts)
-
-
 def ip_to_tuple(ip):
     return tuple(int(part) for part in ip.split("."))
 
 
-# =========================
-# Основное приложение
-# =========================
 class P2PChatApp:
-    def __init__(self, name):
+    def __init__(self, name, bind_ip, broadcast_ip):
         self.name = name
-
-        self.local_ips = get_all_local_ips()
-        self.local_ip_set = set(self.local_ips)
-        self.ip = choose_display_ip(self.local_ips)
-        self.broadcast_addresses = derive_broadcasts_from_all_ips(self.local_ips)
+        self.ip = bind_ip
+        self.broadcast_ip = broadcast_ip
 
         self.running = False
 
@@ -214,7 +143,8 @@ class P2PChatApp:
         except (AttributeError, OSError):
             pass
 
-        sock.bind(("", UDP_PORT))
+        # Слушаем discovery строго на указанном IP
+        sock.bind((self.ip, UDP_PORT))
         self.udp_socket = sock
 
     def create_tcp_server_socket(self):
@@ -226,18 +156,18 @@ class P2PChatApp:
         except (AttributeError, OSError):
             pass
 
-        sock.bind(("", TCP_PORT))
+        # Слушаем TCP строго на указанном IP
+        sock.bind((self.ip, TCP_PORT))
         sock.listen(10)
         self.tcp_server_socket = sock
 
     # -------------------------
-    # Правило выбора одного TCP
+    # Разрешение дублирующихся TCP
     # -------------------------
     def preferred_source_for_peer(self, peer_ip):
-        # Если возникнут два TCP-соединения между одной парой узлов,
-        # оставляем одно по фиксированному правилу.
-        # Узел с меньшим IP оставляет исходящее соединение.
-        # Узел с большим IP оставляет входящее.
+        # Если между одной парой узлов случайно появились два TCP,
+        # оставляем только одно соединение по фиксированному правилу.
+        # Узел с меньшим IP оставляет outgoing, с большим IP – incoming.
         if ip_to_tuple(self.ip) < ip_to_tuple(peer_ip):
             return "outgoing"
         return "incoming"
@@ -296,31 +226,28 @@ class P2PChatApp:
         return True
 
     # -------------------------
-    # UDP: обнаружение
+    # UDP discovery
     # -------------------------
-    def send_hello_once(self):
+    def send_hello(self):
         if self.udp_socket is None:
             return
 
-        message = create_message(MessageType.HELLO, self.name)
+        msg = create_message(MessageType.HELLO, self.name)
 
-        for broadcast_ip in self.broadcast_addresses:
-            try:
-                self.udp_socket.sendto(message, (broadcast_ip, UDP_PORT))
-            except OSError as e:
-                self.add_history_event(
-                    event_type="warn",
-                    content=f"Ошибка отправки HELLO на {broadcast_ip}: {e}"
-                )
+        try:
+            self.udp_socket.sendto(msg, (self.broadcast_ip, UDP_PORT))
+        except OSError as e:
+            self.add_history_event(
+                event_type="warn",
+                content=f"Ошибка отправки HELLO на {self.broadcast_ip}: {e}"
+            )
 
-    def send_hello_burst(self):
-        time.sleep(0.5)
-
-        for _ in range(HELLO_BURST_COUNT):
-            if not self.running:
-                break
-            self.send_hello_once()
-            time.sleep(HELLO_BURST_DELAY)
+    def hello_sender_loop(self):
+        # HELLO рассылаем периодически, но не выводим в историю,
+        # чтобы в LAN новый узел мог быть обнаружен в любой момент.
+        while self.running:
+            self.send_hello()
+            time.sleep(HELLO_INTERVAL)
 
     def udp_listener(self):
         while self.running:
@@ -331,7 +258,7 @@ class P2PChatApp:
 
             sender_ip = addr[0]
 
-            if sender_ip in self.local_ip_set:
+            if sender_ip == self.ip:
                 continue
 
             if len(data) < HEADER_SIZE:
@@ -384,10 +311,10 @@ class P2PChatApp:
                 ).start()
 
     # -------------------------
-    # TCP: исходящее соединение
+    # TCP исходящее
     # -------------------------
     def connect_to_peer(self, peer_ip, peer_name=""):
-        if peer_ip in self.local_ip_set:
+        if peer_ip == self.ip:
             return
 
         with self.peers_lock:
@@ -398,6 +325,11 @@ class P2PChatApp:
         sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            # Критично: исходящий сокет тоже привязываем к нужному IP,
+            # чтобы он не ушёл через другой интерфейс.
+            sock.bind((self.ip, 0))
+
             sock.settimeout(SOCKET_TIMEOUT)
             sock.connect((peer_ip, TCP_PORT))
             sock.settimeout(None)
@@ -427,7 +359,7 @@ class P2PChatApp:
             )
 
     # -------------------------
-    # TCP: входящие соединения
+    # TCP входящее
     # -------------------------
     def tcp_listener(self):
         while self.running:
@@ -445,7 +377,7 @@ class P2PChatApp:
     def handle_incoming_connection(self, peer_sock, peer_addr):
         peer_ip = peer_addr[0]
 
-        if peer_ip in self.local_ip_set:
+        if peer_ip == self.ip:
             try:
                 peer_sock.close()
             except OSError:
@@ -655,19 +587,11 @@ class P2PChatApp:
 
         threading.Thread(target=self.udp_listener, daemon=True).start()
         threading.Thread(target=self.tcp_listener, daemon=True).start()
-        threading.Thread(target=self.send_hello_burst, daemon=True).start()
+        threading.Thread(target=self.hello_sender_loop, daemon=True).start()
 
         self.add_history_event(
             event_type="system",
-            content=f"Чат запущен. Имя: {self.name}, основной IP: {self.ip}"
-        )
-        self.add_history_event(
-            event_type="system",
-            content=f"Локальные IP: {', '.join(self.local_ips)}"
-        )
-        self.add_history_event(
-            event_type="system",
-            content=f"Broadcast-адреса: {', '.join(self.broadcast_addresses)}"
+            content=f"Чат запущен. Имя: {self.name}, IP: {self.ip}, broadcast: {self.broadcast_ip}"
         )
         self.add_history_event(
             event_type="system",
@@ -675,15 +599,22 @@ class P2PChatApp:
         )
 
 
-# =========================
-# Точка входа
-# =========================
-if __name__ == "__main__":
-    user_name = input("Введите имя: ").strip()
-    while not user_name:
-        user_name = input("Имя не может быть пустым. Введите имя: ").strip()
+def parse_args():
+    parser = argparse.ArgumentParser(description="P2P чат для локальной сети")
+    parser.add_argument("--name", required=True, help="Имя пользователя")
+    parser.add_argument("--ip", required=True, help="Локальный IP конкретного интерфейса")
+    parser.add_argument("--broadcast", required=True, help="Broadcast-адрес этой подсети")
+    return parser.parse_args()
 
-    app = P2PChatApp(user_name)
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    app = P2PChatApp(
+        name=args.name.strip(),
+        bind_ip=args.ip.strip(),
+        broadcast_ip=args.broadcast.strip()
+    )
     app.start()
 
     try:

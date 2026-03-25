@@ -6,43 +6,33 @@ from datetime import datetime
 from enum import IntEnum
 
 
-# =========================
-# Константы
-# =========================
 UDP_PORT = 4242
 TCP_PORT = 4243
 BUFFER_SIZE = 4096
 
-HEADER_FORMAT = "!BI"   # 1 byte type, 4 bytes payload length
+HEADER_FORMAT = "!BI"   # 1 байт тип + 4 байта длина полезной нагрузки
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
-HELLO_INTERVAL = 2.0
-KEEPALIVE_INTERVAL = 5.0
 SOCKET_TIMEOUT = 5.0
+HELLO_BURST_COUNT = 3
+HELLO_BURST_DELAY = 0.3
 
 
-# =========================
-# Типы сообщений
-# =========================
 class MessageType(IntEnum):
     CHAT = 1
     NAME = 2
     HELLO = 3
     DISCONNECT = 4
-    KEEPALIVE = 5
 
 
-# =========================
-# Вспомогательные структуры
-# =========================
 class Peer:
-    def __init__(self, ip, name="", sock=None, connected=False, reader_thread=None, keepalive_thread=None):
+    def __init__(self, ip, name="", sock=None, connected=False, reader_thread=None, source=None):
         self.ip = ip
         self.name = name
         self.sock = sock
         self.connected = connected
         self.reader_thread = reader_thread
-        self.keepalive_thread = keepalive_thread
+        self.source = source   # "incoming" или "outgoing"
 
 
 class HistoryEvent:
@@ -73,11 +63,7 @@ class HistoryEvent:
         return f"[{self.timestamp}] {self.content}"
 
 
-# =========================
-# Протокол
-# =========================
 def create_message(msg_type, payload_text=""):
-    msg_type = MessageType(msg_type)
     payload = payload_text.encode("utf-8")
     header = struct.pack(HEADER_FORMAT, int(msg_type), len(payload))
     return header + payload
@@ -109,9 +95,6 @@ def read_message(sock):
     return msg_type, payload.decode("utf-8")
 
 
-# =========================
-# Сетевые утилиты
-# =========================
 def get_all_local_ips():
     ips = {"127.0.0.1"}
 
@@ -129,10 +112,10 @@ def get_all_local_ips():
         pass
 
     try:
-        test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        test_sock.connect(("8.8.8.8", 80))
-        ips.add(test_sock.getsockname()[0])
-        test_sock.close()
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ips.add(s.getsockname()[0])
+        s.close()
     except OSError:
         pass
 
@@ -140,34 +123,26 @@ def get_all_local_ips():
 
 
 def choose_primary_ip(local_ips):
-    for ip in local_ips:
-        if ip.startswith("192.168.") and ip != "127.0.0.1":
-            return ip
-    for ip in local_ips:
-        if ip.startswith("10.") and ip != "127.0.0.1":
-            return ip
-    for ip in local_ips:
-        if ip.startswith("172.") and ip != "127.0.0.1":
-            return ip
+    for prefix in ("192.168.", "10.", "172."):
+        for ip in local_ips:
+            if ip.startswith(prefix) and ip != "127.0.0.1":
+                return ip
+
     for ip in local_ips:
         if ip != "127.0.0.1":
             return ip
+
     return "127.0.0.1"
 
 
 def derive_broadcasts(primary_ip):
     broadcasts = {"255.255.255.255"}
-
     parts = primary_ip.split(".")
     if len(parts) == 4:
         broadcasts.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
-
     return sorted(broadcasts)
 
 
-# =========================
-# Основное приложение
-# =========================
 class P2PChatApp:
     def __init__(self, name):
         self.name = name
@@ -179,7 +154,7 @@ class P2PChatApp:
 
         self.running = False
 
-        self.peers = {}       # ip -> Peer
+        self.peers = {}   # ip -> Peer
         self.history = []
 
         self.peers_lock = threading.Lock()
@@ -216,28 +191,96 @@ class P2PChatApp:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("", TCP_PORT))
-        sock.listen(10)
+        sock.listen(16)
         self.tcp_server_socket = sock
 
     # -------------------------
-    # UDP: обнаружение узлов
+    # Логика выбора "правильного" TCP
     # -------------------------
-    def send_hello(self):
+    def preferred_source_for_peer(self, peer_ip):
+        # Если вдруг два узла одновременно установили два TCP между собой,
+        # оставляем только одно соединение по детерминированному правилу:
+        # узел с меньшим IP хранит outgoing,
+        # узел с большим IP хранит incoming.
+        if self.ip < peer_ip:
+            return "outgoing"
+        return "incoming"
+
+    def register_connection(self, peer_ip, peer_name, sock, source):
+        old_sock_to_close = None
+        need_log_connected = False
+        accepted = False
+
+        with self.peers_lock:
+            existing = self.peers.get(peer_ip)
+            preferred = self.preferred_source_for_peer(peer_ip)
+
+            if existing and existing.connected:
+                if existing.source == preferred and source != preferred:
+                    return False
+
+                if source == preferred and existing.source != preferred:
+                    old_sock_to_close = existing.sock
+                else:
+                    return False
+
+            reader_thread = threading.Thread(
+                target=self.peer_reader_loop,
+                args=(peer_ip, sock, peer_name),
+                daemon=True
+            )
+
+            peer = Peer(
+                ip=peer_ip,
+                name=peer_name or peer_ip,
+                sock=sock,
+                connected=True,
+                reader_thread=reader_thread,
+                source=source
+            )
+            self.peers[peer_ip] = peer
+
+            if not existing or not existing.connected:
+                need_log_connected = True
+
+            accepted = True
+
+        if old_sock_to_close is not None:
+            try:
+                old_sock_to_close.close()
+            except OSError:
+                pass
+
+        if need_log_connected:
+            self.add_history_event(
+                event_type="peer_connected",
+                peer_ip=peer_ip,
+                peer_name=peer_name or peer_ip
+            )
+
+        reader_thread.start()
+        return accepted
+
+    # -------------------------
+    # UDP
+    # -------------------------
+    def send_hello_once(self):
         if self.udp_socket is None:
             return
 
         msg = create_message(MessageType.HELLO, self.name)
-
         for broadcast_ip in self.broadcast_addresses:
             try:
                 self.udp_socket.sendto(msg, (broadcast_ip, UDP_PORT))
-            except OSError as e:
-                self.add_history_event("warn", content=f"Ошибка отправки HELLO на {broadcast_ip}: {e}")
+            except OSError:
+                pass
 
-    def hello_sender_loop(self):
-        while self.running:
-            self.send_hello()
-            time.sleep(HELLO_INTERVAL)
+    def send_hello_burst(self):
+        for _ in range(HELLO_BURST_COUNT):
+            if not self.running:
+                return
+            self.send_hello_once()
+            time.sleep(HELLO_BURST_DELAY)
 
     def udp_listener(self):
         while self.running:
@@ -270,17 +313,21 @@ class P2PChatApp:
             except UnicodeDecodeError:
                 continue
 
+            need_connect = False
             discovered_now = False
 
             with self.peers_lock:
-                if sender_ip not in self.peers:
+                peer = self.peers.get(sender_ip)
+
+                if peer is None:
                     self.peers[sender_ip] = Peer(ip=sender_ip, name=sender_name)
                     discovered_now = True
+                    need_connect = True
                 else:
                     if sender_name:
-                        self.peers[sender_ip].name = sender_name
-
-                already_connected = self.peers[sender_ip].connected
+                        peer.name = sender_name
+                    if not peer.connected:
+                        need_connect = True
 
             if discovered_now:
                 self.add_history_event(
@@ -289,47 +336,13 @@ class P2PChatApp:
                     peer_name=sender_name
                 )
 
-            self.add_history_event(
-                event_type="system",
-                content=f"Получен HELLO от {sender_name} ({sender_ip})"
-            )
-
-            # TCP инициирует только узел с меньшим IP.
-            # Это делает поведение чище и понятнее в Wireshark.
-            if not already_connected and self.ip < sender_ip:
-                self.connect_to_peer(sender_ip, sender_name)
-
-    # -------------------------
-    # KEEPALIVE
-    # -------------------------
-    def keepalive_loop(self, peer_ip, peer_sock):
-        while self.running:
-            with self.peers_lock:
-                if peer_ip not in self.peers:
-                    break
-                if not self.peers[peer_ip].connected:
-                    break
-                if self.peers[peer_ip].sock is not peer_sock:
-                    break
-
-            try:
-                peer_sock.sendall(create_message(MessageType.KEEPALIVE, "ping"))
-            except OSError:
-                break
-
-            time.sleep(KEEPALIVE_INTERVAL)
-
-    def start_keepalive(self, peer_ip, peer_sock):
-        keepalive_thread = threading.Thread(
-            target=self.keepalive_loop,
-            args=(peer_ip, peer_sock),
-            daemon=True
-        )
-        keepalive_thread.start()
-
-        with self.peers_lock:
-            if peer_ip in self.peers:
-                self.peers[peer_ip].keepalive_thread = keepalive_thread
+            # По условию другие узлы, получившие HELLO, устанавливают TCP-соединение.
+            if need_connect:
+                threading.Thread(
+                    target=self.connect_to_peer,
+                    args=(sender_ip, sender_name),
+                    daemon=True
+                ).start()
 
     # -------------------------
     # TCP: исходящее подключение
@@ -339,76 +352,45 @@ class P2PChatApp:
             return
 
         with self.peers_lock:
-            if peer_ip in self.peers and self.peers[peer_ip].connected:
+            existing = self.peers.get(peer_ip)
+            if existing and existing.connected:
                 return
 
-        self.add_history_event(
-            event_type="system",
-            content=f"Попытка TCP-подключения к {peer_name or peer_ip} ({peer_ip}:{TCP_PORT})"
-        )
-
-        tcp_sock = None
+        sock = None
         try:
-            tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            tcp_sock.settimeout(SOCKET_TIMEOUT)
-            tcp_sock.connect((peer_ip, TCP_PORT))
-            tcp_sock.settimeout(None)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(SOCKET_TIMEOUT)
+            sock.connect((peer_ip, TCP_PORT))
+            sock.settimeout(None)
 
-            # Небольшая задержка, чтобы handshake и дальнейший обмен было проще увидеть в Wireshark
-            time.sleep(0.5)
+            sock.sendall(create_message(MessageType.NAME, self.name))
 
-            self.add_history_event(
-                event_type="system",
-                content=f"TCP connect успешно выполнен к {peer_ip}:{TCP_PORT}"
-            )
-
-            self.add_history_event(
-                event_type="system",
-                content=f"TCP сокет открыт: local={tcp_sock.getsockname()}, remote={tcp_sock.getpeername()}"
-            )
-
-            tcp_sock.sendall(create_message(MessageType.NAME, self.name))
-
-            peer = Peer(
-                ip=peer_ip,
-                name=peer_name or peer_ip,
-                sock=tcp_sock,
-                connected=True
-            )
-
-            reader_thread = threading.Thread(
-                target=self.peer_reader_loop,
-                args=(peer_ip, tcp_sock, peer.name),
-                daemon=True
-            )
-            peer.reader_thread = reader_thread
-
-            with self.peers_lock:
-                if peer_ip in self.peers and self.peers[peer_ip].connected:
-                    tcp_sock.close()
-                    return
-
-                self.peers[peer_ip] = peer
-
-            self.add_history_event(
-                event_type="peer_connected",
+            accepted = self.register_connection(
                 peer_ip=peer_ip,
-                peer_name=peer.name
+                peer_name=peer_name or peer_ip,
+                sock=sock,
+                source="outgoing"
             )
 
-            reader_thread.start()
-            self.start_keepalive(peer_ip, tcp_sock)
+            if not accepted:
+                sock.close()
 
         except OSError as e:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+            with self.peers_lock:
+                peer = self.peers.get(peer_ip)
+                if peer and not peer.connected:
+                    peer.name = peer_name or peer.name
+
             self.add_history_event(
                 event_type="warn",
                 content=f"Не удалось подключиться к {peer_name or peer_ip} ({peer_ip}:{TCP_PORT}): {e}"
             )
-            if tcp_sock is not None:
-                try:
-                    tcp_sock.close()
-                except OSError:
-                    pass
 
     # -------------------------
     # TCP: входящие подключения
@@ -420,12 +402,11 @@ class P2PChatApp:
             except OSError:
                 break
 
-            thread = threading.Thread(
+            threading.Thread(
                 target=self.handle_incoming_connection,
                 args=(peer_sock, peer_addr),
                 daemon=True
-            )
-            thread.start()
+            ).start()
 
     def handle_incoming_connection(self, peer_sock, peer_addr):
         peer_ip = peer_addr[0]
@@ -436,16 +417,6 @@ class P2PChatApp:
             except OSError:
                 pass
             return
-
-        self.add_history_event(
-            event_type="system",
-            content=f"Принято входящее TCP-соединение от {peer_ip}"
-        )
-
-        self.add_history_event(
-            event_type="system",
-            content=f"Принят TCP сокет: local={peer_sock.getsockname()}, remote={peer_sock.getpeername()}"
-        )
 
         try:
             peer_sock.settimeout(SOCKET_TIMEOUT)
@@ -458,39 +429,27 @@ class P2PChatApp:
 
             peer_name = payload or peer_ip
 
-            self.add_history_event(
-                event_type="system",
-                content=f"По TCP получено имя узла {peer_name} от {peer_ip}"
-            )
-
             with self.peers_lock:
-                if peer_ip in self.peers and self.peers[peer_ip].connected:
-                    peer_sock.close()
-                    return
+                if peer_ip not in self.peers:
+                    self.peers[peer_ip] = Peer(ip=peer_ip, name=peer_name)
+                    self.add_history_event(
+                        event_type="peer_discovered",
+                        peer_ip=peer_ip,
+                        peer_name=peer_name
+                    )
+                else:
+                    if peer_name:
+                        self.peers[peer_ip].name = peer_name
 
-                peer = Peer(
-                    ip=peer_ip,
-                    name=peer_name,
-                    sock=peer_sock,
-                    connected=True
-                )
-
-                reader_thread = threading.Thread(
-                    target=self.peer_reader_loop,
-                    args=(peer_ip, peer_sock, peer_name),
-                    daemon=True
-                )
-                peer.reader_thread = reader_thread
-                self.peers[peer_ip] = peer
-
-            self.add_history_event(
-                event_type="peer_connected",
+            accepted = self.register_connection(
                 peer_ip=peer_ip,
-                peer_name=peer_name
+                peer_name=peer_name,
+                sock=peer_sock,
+                source="incoming"
             )
 
-            reader_thread.start()
-            self.start_keepalive(peer_ip, peer_sock)
+            if not accepted:
+                peer_sock.close()
 
         except (ConnectionError, OSError) as e:
             self.add_history_event(
@@ -503,7 +462,7 @@ class P2PChatApp:
                 pass
 
     # -------------------------
-    # Чтение TCP-сообщений
+    # Чтение TCP
     # -------------------------
     def peer_reader_loop(self, peer_ip, peer_sock, peer_name=""):
         try:
@@ -520,10 +479,6 @@ class P2PChatApp:
                         peer_name=actual_name,
                         content=payload
                     )
-
-                elif msg_type == MessageType.KEEPALIVE:
-                    # Не выводим keepalive в чат
-                    continue
 
                 elif msg_type == MessageType.DISCONNECT:
                     with self.peers_lock:
@@ -547,7 +502,7 @@ class P2PChatApp:
                     peer_name=actual_name
                 )
         finally:
-            self.mark_peer_disconnected(peer_ip)
+            self.mark_peer_disconnected(peer_ip, peer_sock)
             try:
                 peer_sock.close()
             except OSError:
@@ -556,12 +511,23 @@ class P2PChatApp:
     # -------------------------
     # Работа с peers
     # -------------------------
+    def mark_peer_disconnected(self, peer_ip, disconnected_sock=None):
+        with self.peers_lock:
+            peer = self.peers.get(peer_ip)
+            if peer is None:
+                return
+
+            if disconnected_sock is not None and peer.sock is not disconnected_sock:
+                return
+
+            peer.connected = False
+            peer.sock = None
+            peer.reader_thread = None
+            peer.source = None
+
     def show_peers(self):
         with self.peers_lock:
             peers_copy = list(self.peers.values())
-
-        connected = [p for p in peers_copy if p.connected]
-        disconnected = [p for p in peers_copy if not p.connected]
 
         if not peers_copy:
             self.add_history_event(event_type="system", content="Узлы не обнаружены")
@@ -569,14 +535,12 @@ class P2PChatApp:
 
         self.add_history_event(event_type="system", content="Список узлов:")
 
-        for peer in connected:
-            print(f"    [CONNECTED] {peer.name} ({peer.ip})")
-
-        for peer in disconnected:
-            print(f"    [SEEN]      {peer.name} ({peer.ip})")
+        for peer in peers_copy:
+            state = "CONNECTED" if peer.connected else "SEEN"
+            print(f"    [{state}] {peer.name} ({peer.ip})")
 
     # -------------------------
-    # Отправка сообщений всем
+    # Отправка сообщений
     # -------------------------
     def broadcast_chat_message(self, text):
         with self.peers_lock:
@@ -590,7 +554,7 @@ class P2PChatApp:
                     peer.sock.sendall(create_message(MessageType.CHAT, text))
                     sent_to_anyone = True
                 except OSError:
-                    self.mark_peer_disconnected(peer.ip)
+                    self.mark_peer_disconnected(peer.ip, peer.sock)
 
         if sent_to_anyone:
             self.add_history_event(
@@ -606,14 +570,6 @@ class P2PChatApp:
     # -------------------------
     # Отключение
     # -------------------------
-    def mark_peer_disconnected(self, peer_ip):
-        with self.peers_lock:
-            if peer_ip in self.peers:
-                self.peers[peer_ip].connected = False
-                self.peers[peer_ip].sock = None
-                self.peers[peer_ip].reader_thread = None
-                self.peers[peer_ip].keepalive_thread = None
-
     def shutdown(self):
         self.running = False
 
@@ -654,16 +610,10 @@ class P2PChatApp:
     def start(self):
         self.create_udp_socket()
         self.create_tcp_server_socket()
-
         self.running = True
 
-        udp_thread = threading.Thread(target=self.udp_listener, daemon=True)
-        tcp_thread = threading.Thread(target=self.tcp_listener, daemon=True)
-        hello_thread = threading.Thread(target=self.hello_sender_loop, daemon=True)
-
-        udp_thread.start()
-        tcp_thread.start()
-        hello_thread.start()
+        threading.Thread(target=self.udp_listener, daemon=True).start()
+        threading.Thread(target=self.tcp_listener, daemon=True).start()
 
         self.add_history_event(
             event_type="system",
@@ -682,10 +632,10 @@ class P2PChatApp:
             content="Команды: /peers, /exit"
         )
 
+        # Отправляем HELLO только при подключении к сети, а не постоянно.
+        threading.Thread(target=self.send_hello_burst, daemon=True).start()
 
-# =========================
-# Точка входа
-# =========================
+
 if __name__ == "__main__":
     user_name = input("Введите имя: ").strip()
     while not user_name:

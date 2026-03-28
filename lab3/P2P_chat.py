@@ -19,6 +19,8 @@ class MessageType(IntEnum):
     NAME = 2
     HELLO = 3
     DISCONNECT = 4
+    HISTORY_REQUEST = 5
+    HISTORY_RESPONSE = 6
 
 
 class Peer:
@@ -71,6 +73,25 @@ class HistoryEvent:
         if self.event_type == "error":
             return f"[{self.timestamp}] [ERROR] {self.content}"
         return f"[{self.timestamp}] {self.content}"
+
+    def to_dict(self):
+        return {
+            "timestamp": self.timestamp,
+            "event_type": self.event_type,
+            "peer_ip": self.peer_ip,
+            "peer_name": self.peer_name,
+            "content": self.content
+        }
+
+    @staticmethod
+    def from_dict(data):
+        return HistoryEvent(
+            event_type=str(data.get("event_type", "system")),
+            peer_ip=str(data.get("peer_ip", "")),
+            peer_name=str(data.get("peer_name", "")),
+            content=str(data.get("content", "")),
+            timestamp=str(data.get("timestamp", datetime.now().strftime("%H:%M:%S")))
+        )
 
 
 def create_message(msg_type, payload_text=""):
@@ -218,22 +239,25 @@ class P2PChatApp:
         self.name = name
         self.ip = bind_ip
         self.udp_port = udp_port
-        self.tcp_port = tcp_port  # общий TCP-порт для всех узлов
+        self.tcp_port = tcp_port
 
         self.local_ips = get_all_local_ipv4()
         self.broadcast_addresses = derive_broadcast_addresses(self.ip)
 
         self.running = False
 
-        # key = peer_ip
         self.peers = {}
         self.history = []
 
         self.peers_lock = threading.Lock()
         self.history_lock = threading.Lock()
+        self.history_request_lock = threading.Lock()
 
         self.udp_socket = None
         self.tcp_server_socket = None
+
+        self.auto_history_requested = False
+        self.auto_history_received = False
 
     def add_history_event(self, event_type, peer_ip="", peer_name="", content=""):
         event = HistoryEvent(
@@ -248,10 +272,6 @@ class P2PChatApp:
 
     def validate_not_self_target(self, peer_ip, context):
         if peer_ip == self.ip:
-            self.add_history_event(
-                event_type="warn",
-                content=f"Игнорируется {context}: собственный узел {peer_ip}"
-            )
             return False
         return True
 
@@ -287,6 +307,14 @@ class P2PChatApp:
         if peer and peer.name:
             return peer.name
         return fallback or peer_ip
+
+    def get_peer_by_name(self, peer_name):
+        target = peer_name.casefold()
+        with self.peers_lock:
+            for peer in self.peers.values():
+                if peer.name and peer.name.casefold() == target:
+                    return peer
+        return None
 
     def is_connected(self, peer_ip):
         peer = self.get_peer(peer_ip)
@@ -325,6 +353,15 @@ class P2PChatApp:
         for peer in peers_copy:
             state = "CONNECTED" if peer.connected else "SEEN"
             print(f"    [{state}] {peer.name} ({peer.ip})")
+
+    def show_help(self):
+        print("Доступные команды:")
+        print("/help - показать список команд")
+        print("/peers - показать список узлов")
+        print("/rescan - повторно отправить широковещательный HELLO")
+        print("/history <ник> - запросить историю у узла по нику")
+        print("/exit - выйти из чата")
+        print("Любой другой текст отправляется как сообщение в чат")
 
     def create_udp_socket(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -367,8 +404,6 @@ class P2PChatApp:
 
         peer = self.get_peer(peer_ip)
 
-        # Если узел уже известен, но сейчас отключён,
-        # пробуем восстановить соединение сразу.
         if peer is not None and not peer.connected:
             self.connect_to_peer(peer_ip, self.get_peer_name(peer_ip))
             return
@@ -376,11 +411,112 @@ class P2PChatApp:
         if self.is_connected(peer_ip):
             return
 
-        # Для первого подключения оставляем старое правило:
-        # соединение инициирует узел с меньшим IP.
         if self.ip < peer_ip:
             peer_name = self.get_peer_name(peer_ip)
             self.connect_to_peer(peer_ip, peer_name)
+
+    def request_history_from_peer_name(self, peer_name):
+        peer = self.get_peer_by_name(peer_name)
+        if peer is None:
+            self.add_history_event("warn", content=f"Узел с ником '{peer_name}' не найден")
+            return
+
+        if not peer.connected or peer.sock is None:
+            self.add_history_event("warn", content=f"Узел {peer.name} ({peer.ip}) не подключён")
+            return
+
+        try:
+            peer.sock.sendall(create_message(MessageType.HISTORY_REQUEST, ""))
+            self.add_history_event(
+                event_type="system",
+                content=f"Запрошена история у узла {peer.name} ({peer.ip})"
+            )
+        except OSError as e:
+            self.add_history_event(
+                event_type="warn",
+                content=f"Не удалось запросить историю у {peer.name} ({peer.ip}): {e}"
+            )
+
+    def maybe_request_history_automatically(self, peer_ip):
+        with self.history_request_lock:
+            if self.auto_history_requested or self.auto_history_received:
+                return
+
+            peer = self.get_peer(peer_ip)
+            if peer is None or not peer.connected or peer.sock is None:
+                return
+
+            try:
+                peer.sock.sendall(create_message(MessageType.HISTORY_REQUEST, ""))
+                self.auto_history_requested = True
+                self.add_history_event(
+                    event_type="system",
+                    content=f"Автоматически запрошена история у узла {peer.name} ({peer.ip})"
+                )
+            except OSError as e:
+                self.add_history_event(
+                    event_type="warn",
+                    content=f"Не удалось автоматически запросить историю у {peer.name} ({peer.ip}): {e}"
+                )
+
+    def serialize_history(self):
+        with self.history_lock:
+            return json.dumps([event.to_dict() for event in self.history], ensure_ascii=False)
+
+    def send_history_response(self, peer_sock):
+        payload = self.serialize_history()
+        peer_sock.sendall(create_message(MessageType.HISTORY_RESPONSE, payload))
+
+    def apply_received_history(self, payload, from_ip, from_name):
+        try:
+            raw_events = json.loads(payload)
+            if not isinstance(raw_events, list):
+                raise ValueError("history payload is not a list")
+        except (json.JSONDecodeError, ValueError) as e:
+            self.add_history_event("warn", content=f"Получена некорректная история: {e}")
+            return
+
+        with self.history_lock:
+            existing_keys = {
+                (e.timestamp, e.event_type, e.peer_ip, e.peer_name, e.content)
+                for e in self.history
+            }
+
+        imported_events = []
+        for item in raw_events:
+            try:
+                event = HistoryEvent.from_dict(item)
+            except Exception:
+                continue
+
+            key = (event.timestamp, event.event_type, event.peer_ip, event.peer_name, event.content)
+            if key in existing_keys:
+                continue
+
+            imported_events.append(event)
+            existing_keys.add(key)
+
+        if not imported_events:
+            self.auto_history_received = True
+            self.add_history_event(
+                "system",
+                content=f"История от узла {from_name} ({from_ip}) получена, новых записей нет"
+            )
+            return
+
+        with self.history_lock:
+            self.history.extend(imported_events)
+
+        print(f"===== ПОЛУЧЕННАЯ ИСТОРИЯ ОТ {from_name} ({from_ip}) =====")
+        for event in imported_events:
+            print(event.format_for_display())
+        print("===== КОНЕЦ ИСТОРИИ =====")
+
+        self.auto_history_received = True
+        self.add_history_event(
+            event_type="system",
+            content=f"Получена история от узла {from_name} ({from_ip}): {len(imported_events)} записей"
+        )
 
     def udp_listener(self):
         while self.running:
@@ -445,7 +581,6 @@ class P2PChatApp:
             tcp_sock.connect((peer_ip, self.tcp_port))
             tcp_sock.settimeout(None)
 
-            # По TCP передаём только имя
             tcp_sock.sendall(create_message(MessageType.NAME, self.name))
 
             with self.peers_lock:
@@ -475,6 +610,7 @@ class P2PChatApp:
             )
 
             reader_thread.start()
+            self.maybe_request_history_automatically(peer_ip)
 
         except OSError as e:
             if tcp_sock is not None:
@@ -514,7 +650,6 @@ class P2PChatApp:
                 peer_sock.close()
                 return
 
-            # NAME содержит только имя
             peer_name = payload.strip()
             if not peer_name:
                 peer_sock.close()
@@ -557,6 +692,7 @@ class P2PChatApp:
             )
 
             reader_thread.start()
+            self.maybe_request_history_automatically(peer_ip)
 
         except (ConnectionError, OSError):
             try:
@@ -589,6 +725,16 @@ class P2PChatApp:
                     )
                     disconnect_logged = True
                     break
+
+                elif msg_type == MessageType.HISTORY_REQUEST:
+                    self.send_history_response(peer_sock)
+                    self.add_history_event(
+                        event_type="system",
+                        content=f"История отправлена узлу {self.get_peer_name(peer_ip, peer_name)} ({peer_ip})"
+                    )
+
+                elif msg_type == MessageType.HISTORY_RESPONSE:
+                    self.apply_received_history(payload, peer_ip, self.get_peer_name(peer_ip, peer_name))
 
         except (ConnectionError, OSError):
             if self.running:
@@ -699,22 +845,6 @@ class P2PChatApp:
             event_type="system",
             content=f"Чат запущен. Имя: {self.name}, IP: {self.ip}, UDP: {self.udp_port}, TCP: {self.tcp_port}"
         )
-        self.add_history_event(
-            event_type="system",
-            content=f"Broadcast-адреса: {', '.join(self.broadcast_addresses)}"
-        )
-        self.add_history_event(
-            event_type="system",
-            content="Команды: /peers, /rescan, /exit"
-        )
-        self.add_history_event(
-            event_type="system",
-            content=f"Порты загружены из {CONFIG_FILE}"
-        )
-        self.add_history_event(
-            event_type="system",
-            content="Важно: у всех узлов должен быть одинаковый TCP-порт из config.json"
-        )
 
         self.send_hello_broadcast()
 
@@ -744,12 +874,24 @@ if __name__ == "__main__":
                 app.shutdown()
                 break
 
+            if text.lower() == "/help":
+                app.show_help()
+                continue
+
             if text.lower() == "/peers":
                 app.show_peers()
                 continue
 
             if text.lower() == "/rescan":
                 app.rescan()
+                continue
+
+            if text.lower().startswith("/history "):
+                parts = text.split(maxsplit=1)
+                if len(parts) != 2 or not parts[1].strip():
+                    app.add_history_event("warn", content="Использование: /history <ник>")
+                else:
+                    app.request_history_from_peer_name(parts[1].strip())
                 continue
 
             app.broadcast_chat_message(text)

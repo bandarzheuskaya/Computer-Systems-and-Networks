@@ -11,6 +11,7 @@ BUFFER_SIZE = 4096
 HEADER_FORMAT = "!BI"   # 1 byte type, 4 bytes payload length
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 SOCKET_TIMEOUT = 5.0
+CONFIG_FILE = "config.json"
 
 
 class MessageType(IntEnum):
@@ -24,14 +25,12 @@ class Peer:
     def __init__(
         self,
         ip,
-        tcp_port,
         name="",
         sock=None,
         connected=False,
         reader_thread=None
     ):
         self.ip = ip
-        self.tcp_port = tcp_port
         self.name = name
         self.sock = sock
         self.connected = connected
@@ -39,25 +38,21 @@ class Peer:
 
     @property
     def key(self):
-        return self.ip, self.tcp_port
+        return self.ip
 
 
 class HistoryEvent:
-    def __init__(self, event_type, peer_ip="", peer_name="", peer_tcp_port=None, content="", timestamp=None):
+    def __init__(self, event_type, peer_ip="", peer_name="", content="", timestamp=None):
         self.timestamp = timestamp or datetime.now().strftime("%H:%M:%S")
         self.event_type = event_type
         self.peer_ip = peer_ip
         self.peer_name = peer_name
-        self.peer_tcp_port = peer_tcp_port
         self.content = content
 
     def format_for_display(self):
         peer_suffix = ""
         if self.peer_ip:
-            if self.peer_tcp_port is not None:
-                peer_suffix = f"{self.peer_name} ({self.peer_ip}:{self.peer_tcp_port})"
-            else:
-                peer_suffix = f"{self.peer_name} ({self.peer_ip})"
+            peer_suffix = f"{self.peer_name} ({self.peer_ip})"
 
         if self.event_type == "peer_discovered":
             return f"[{self.timestamp}] [INFO] Обнаружен узел: {peer_suffix}"
@@ -161,16 +156,6 @@ def choose_ip_interactively(local_ips):
             print("Неверный ввод. Введите номер из списка или корректный IPv4-адрес.")
 
 
-def choose_port_interactively(prompt):
-    while True:
-        raw = input(prompt).strip()
-        if raw.isdigit():
-            port = int(raw)
-            if 1 <= port <= 65535:
-                return port
-        print("Введите целое число от 1 до 65535.")
-
-
 def is_port_available(ip, port, sock_type):
     test_sock = socket.socket(socket.AF_INET, sock_type)
     try:
@@ -205,18 +190,42 @@ def derive_broadcast_addresses(ip):
     return sorted(result)
 
 
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        udp_port = int(data["udp_port"])
+        tcp_port = int(data["tcp_port"])
+
+        if not (1 <= udp_port <= 65535):
+            raise ValueError("udp_port вне диапазона 1..65535")
+        if not (1 <= tcp_port <= 65535):
+            raise ValueError("tcp_port вне диапазона 1..65535")
+
+        return udp_port, tcp_port
+
+    except FileNotFoundError:
+        raise OSError(f"Файл конфигурации {CONFIG_FILE} не найден")
+    except KeyError as e:
+        raise OSError(f"В {CONFIG_FILE} отсутствует поле: {e}")
+    except (ValueError, TypeError, json.JSONDecodeError) as e:
+        raise OSError(f"Некорректный {CONFIG_FILE}: {e}")
+
+
 class P2PChatApp:
     def __init__(self, name, bind_ip, udp_port, tcp_port):
         self.name = name
         self.ip = bind_ip
         self.udp_port = udp_port
-        self.tcp_port = tcp_port
+        self.tcp_port = tcp_port  # общий TCP-порт для всех узлов
 
         self.local_ips = get_all_local_ipv4()
         self.broadcast_addresses = derive_broadcast_addresses(self.ip)
 
         self.running = False
 
+        # key = peer_ip
         self.peers = {}
         self.history = []
 
@@ -226,87 +235,82 @@ class P2PChatApp:
         self.udp_socket = None
         self.tcp_server_socket = None
 
-    @property
-    def self_key(self):
-        return self.ip, self.tcp_port
-
-    def add_history_event(self, event_type, peer_ip="", peer_name="", peer_tcp_port=None, content=""):
+    def add_history_event(self, event_type, peer_ip="", peer_name="", content=""):
         event = HistoryEvent(
             event_type=event_type,
             peer_ip=peer_ip,
             peer_name=peer_name,
-            peer_tcp_port=peer_tcp_port,
             content=content
         )
         with self.history_lock:
             self.history.append(event)
         print(event.format_for_display())
 
-    def make_peer_key(self, peer_ip, peer_tcp_port):
-        return peer_ip, peer_tcp_port
+    def validate_not_self_target(self, peer_ip, context):
+        if peer_ip == self.ip:
+            self.add_history_event(
+                event_type="warn",
+                content=f"Игнорируется {context}: собственный узел {peer_ip}"
+            )
+            return False
+        return True
 
-    def ensure_peer_exists(self, peer_ip, peer_tcp_port, peer_name=""):
-        key = self.make_peer_key(peer_ip, peer_tcp_port)
+    def ensure_peer_exists(self, peer_ip, peer_name=""):
         discovered_now = False
 
         with self.peers_lock:
-            if key not in self.peers:
-                self.peers[key] = Peer(
+            if peer_ip not in self.peers:
+                self.peers[peer_ip] = Peer(
                     ip=peer_ip,
-                    tcp_port=peer_tcp_port,
                     name=peer_name or peer_ip
                 )
                 discovered_now = True
             else:
                 if peer_name:
-                    self.peers[key].name = peer_name
+                    self.peers[peer_ip].name = peer_name
 
-            current_name = self.peers[key].name
+            current_name = self.peers[peer_ip].name
 
         if discovered_now:
             self.add_history_event(
                 event_type="peer_discovered",
                 peer_ip=peer_ip,
-                peer_name=current_name,
-                peer_tcp_port=peer_tcp_port
+                peer_name=current_name
             )
 
-    def get_peer(self, peer_ip, peer_tcp_port):
-        key = self.make_peer_key(peer_ip, peer_tcp_port)
+    def get_peer(self, peer_ip):
         with self.peers_lock:
-            return self.peers.get(key)
+            return self.peers.get(peer_ip)
 
-    def get_peer_name(self, peer_ip, peer_tcp_port, fallback=""):
-        peer = self.get_peer(peer_ip, peer_tcp_port)
+    def get_peer_name(self, peer_ip, fallback=""):
+        peer = self.get_peer(peer_ip)
         if peer and peer.name:
             return peer.name
         return fallback or peer_ip
 
-    def is_connected(self, peer_ip, peer_tcp_port):
-        peer = self.get_peer(peer_ip, peer_tcp_port)
+    def is_connected(self, peer_ip):
+        peer = self.get_peer(peer_ip)
         return bool(peer and peer.connected)
 
-    def mark_peer_disconnected(self, peer_ip, peer_tcp_port, emit_event=False):
-        key = self.make_peer_key(peer_ip, peer_tcp_port)
+    def mark_peer_disconnected(self, peer_ip, emit_event=False):
         event_data = None
 
         with self.peers_lock:
-            if key in self.peers:
-                peer = self.peers[key]
+            if peer_ip in self.peers:
+                peer = self.peers[peer_ip]
                 was_connected = peer.connected
                 peer.connected = False
                 peer.sock = None
                 peer.reader_thread = None
 
                 if emit_event and was_connected:
-                    event_data = (peer.ip, peer.tcp_port, peer.name)
+                    event_data = (peer.ip, peer.name)
 
         if event_data:
             self.add_history_event(
                 event_type="peer_disconnected",
                 peer_ip=event_data[0],
-                peer_name=event_data[2],
-                peer_tcp_port=event_data[1]
+                peer_name=event_data[1]
             )
 
     def show_peers(self):
@@ -320,7 +324,7 @@ class P2PChatApp:
         self.add_history_event(event_type="system", content="Список узлов:")
         for peer in peers_copy:
             state = "CONNECTED" if peer.connected else "SEEN"
-            print(f"    [{state}] {peer.name} ({peer.ip}:{peer.tcp_port})")
+            print(f"    [{state}] {peer.name} ({peer.ip})")
 
     def create_udp_socket(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -337,22 +341,7 @@ class P2PChatApp:
         self.tcp_server_socket = sock
 
     def make_hello_payload(self):
-        data = {
-            "name": self.name,
-            "tcp_port": self.tcp_port
-        }
-        return json.dumps(data, ensure_ascii=False)
-
-    def parse_hello_payload(self, payload):
-        try:
-            data = json.loads(payload)
-            name = str(data.get("name", "")).strip()
-            tcp_port = int(data.get("tcp_port"))
-            if not (1 <= tcp_port <= 65535):
-                return None, None
-            return name, tcp_port
-        except (ValueError, TypeError, json.JSONDecodeError):
-            return None, None
+        return self.name
 
     def send_udp_packet(self, target_ip, msg_type, payload):
         try:
@@ -372,16 +361,26 @@ class P2PChatApp:
         self.add_history_event("system", content="Повторное обнаружение узлов...")
         self.send_hello_broadcast()
 
-    def maybe_connect_by_rule(self, peer_ip, peer_tcp_port):
-        if (peer_ip, peer_tcp_port) == self.self_key:
+    def maybe_connect_by_rule(self, peer_ip):
+        if not self.validate_not_self_target(peer_ip, "попытка TCP-подключения к самому себе"):
             return
 
-        if self.is_connected(peer_ip, peer_tcp_port):
+        peer = self.get_peer(peer_ip)
+
+        # Если узел уже известен, но сейчас отключён,
+        # пробуем восстановить соединение сразу.
+        if peer is not None and not peer.connected:
+            self.connect_to_peer(peer_ip, self.get_peer_name(peer_ip))
             return
 
-        if self.self_key < (peer_ip, peer_tcp_port):
-            peer_name = self.get_peer_name(peer_ip, peer_tcp_port)
-            self.connect_to_peer(peer_ip, peer_tcp_port, peer_name)
+        if self.is_connected(peer_ip):
+            return
+
+        # Для первого подключения оставляем старое правило:
+        # соединение инициирует узел с меньшим IP.
+        if self.ip < peer_ip:
+            peer_name = self.get_peer_name(peer_ip)
+            self.connect_to_peer(peer_ip, peer_name)
 
     def udp_listener(self):
         while self.running:
@@ -411,23 +410,22 @@ class P2PChatApp:
             if msg_type != MessageType.HELLO:
                 continue
 
-            sender_name, sender_tcp_port = self.parse_hello_payload(payload)
-            if not sender_name or sender_tcp_port is None:
+            sender_name = payload.strip()
+            if not sender_name:
                 continue
 
-            if (sender_ip, sender_tcp_port) == self.self_key:
+            if not self.validate_not_self_target(sender_ip, "обнаружение собственного HELLO"):
                 continue
 
-            self.ensure_peer_exists(sender_ip, sender_tcp_port, sender_name)
-            self.maybe_connect_by_rule(sender_ip, sender_tcp_port)
+            self.ensure_peer_exists(sender_ip, sender_name)
+            self.maybe_connect_by_rule(sender_ip)
 
-    def connect_to_peer(self, peer_ip, peer_tcp_port, peer_name=""):
-        if (peer_ip, peer_tcp_port) == self.self_key:
+    def connect_to_peer(self, peer_ip, peer_name=""):
+        if not self.validate_not_self_target(peer_ip, "исходящее TCP-подключение к самому себе"):
             return
 
         with self.peers_lock:
-            key = self.make_peer_key(peer_ip, peer_tcp_port)
-            if key in self.peers and self.peers[key].connected:
+            if peer_ip in self.peers and self.peers[peer_ip].connected:
                 return
 
         tcp_sock = None
@@ -444,43 +442,36 @@ class P2PChatApp:
             tcp_sock.bind((self.ip, 0))
 
             tcp_sock.settimeout(SOCKET_TIMEOUT)
-            tcp_sock.connect((peer_ip, peer_tcp_port))
+            tcp_sock.connect((peer_ip, self.tcp_port))
             tcp_sock.settimeout(None)
 
-            # Теперь по TCP передаём не только имя, но и listening TCP-порт
-            name_payload = json.dumps({
-                "name": self.name,
-                "tcp_port": self.tcp_port
-            }, ensure_ascii=False)
-            tcp_sock.sendall(create_message(MessageType.NAME, name_payload))
+            # По TCP передаём только имя
+            tcp_sock.sendall(create_message(MessageType.NAME, self.name))
 
             with self.peers_lock:
-                key = self.make_peer_key(peer_ip, peer_tcp_port)
-                if key in self.peers and self.peers[key].connected:
+                if peer_ip in self.peers and self.peers[peer_ip].connected:
                     tcp_sock.close()
                     return
 
-                actual_name = peer_name or self.get_peer_name(peer_ip, peer_tcp_port, peer_ip)
+                actual_name = peer_name or self.get_peer_name(peer_ip, peer_ip)
                 peer = Peer(
                     ip=peer_ip,
-                    tcp_port=peer_tcp_port,
                     name=actual_name,
                     sock=tcp_sock,
                     connected=True
                 )
                 reader_thread = threading.Thread(
                     target=self.peer_reader_loop,
-                    args=(peer_ip, peer_tcp_port, tcp_sock, actual_name),
+                    args=(peer_ip, tcp_sock, actual_name),
                     daemon=True
                 )
                 peer.reader_thread = reader_thread
-                self.peers[key] = peer
+                self.peers[peer_ip] = peer
 
             self.add_history_event(
                 event_type="peer_connected",
                 peer_ip=peer_ip,
-                peer_name=self.get_peer_name(peer_ip, peer_tcp_port, peer_ip),
-                peer_tcp_port=peer_tcp_port
+                peer_name=self.get_peer_name(peer_ip, peer_ip)
             )
 
             reader_thread.start()
@@ -494,7 +485,7 @@ class P2PChatApp:
 
             self.add_history_event(
                 event_type="warn",
-                content=f"Не удалось подключиться к {peer_name or peer_ip} ({peer_ip}:{peer_tcp_port}): {e}"
+                content=f"Не удалось подключиться к {peer_name or peer_ip} ({peer_ip}:{self.tcp_port}): {e}"
             )
 
     def tcp_listener(self):
@@ -523,31 +514,29 @@ class P2PChatApp:
                 peer_sock.close()
                 return
 
-            # Теперь NAME содержит JSON: {"name": "...", "tcp_port": ...}
-            peer_name, peer_tcp_port = self.parse_hello_payload(payload)
-
-            if not peer_name or peer_tcp_port is None:
+            # NAME содержит только имя
+            peer_name = payload.strip()
+            if not peer_name:
                 peer_sock.close()
                 return
 
-            # Если это вдруг соединение от самого себя – игнорируем
-            if (peer_ip, peer_tcp_port) == self.self_key:
+            if not self.validate_not_self_target(peer_ip, "входящее TCP-подключение от самого себя"):
+                try:
+                    peer_sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 peer_sock.close()
                 return
 
-            # Даже если мы раньше не видели HELLO от этого узла,
-            # теперь можем создать peer по данным из TCP NAME
-            self.ensure_peer_exists(peer_ip, peer_tcp_port, peer_name)
+            self.ensure_peer_exists(peer_ip, peer_name)
 
             with self.peers_lock:
-                key = self.make_peer_key(peer_ip, peer_tcp_port)
-                if key in self.peers and self.peers[key].connected:
+                if peer_ip in self.peers and self.peers[peer_ip].connected:
                     peer_sock.close()
                     return
 
                 peer_obj = Peer(
                     ip=peer_ip,
-                    tcp_port=peer_tcp_port,
                     name=peer_name,
                     sock=peer_sock,
                     connected=True
@@ -555,17 +544,16 @@ class P2PChatApp:
 
                 reader_thread = threading.Thread(
                     target=self.peer_reader_loop,
-                    args=(peer_ip, peer_tcp_port, peer_sock, peer_name),
+                    args=(peer_ip, peer_sock, peer_name),
                     daemon=True
                 )
                 peer_obj.reader_thread = reader_thread
-                self.peers[key] = peer_obj
+                self.peers[peer_ip] = peer_obj
 
             self.add_history_event(
                 event_type="peer_connected",
                 peer_ip=peer_ip,
-                peer_name=peer_name,
-                peer_tcp_port=peer_tcp_port
+                peer_name=peer_name
             )
 
             reader_thread.start()
@@ -576,7 +564,7 @@ class P2PChatApp:
             except OSError:
                 pass
 
-    def peer_reader_loop(self, peer_ip, peer_tcp_port, peer_sock, peer_name=""):
+    def peer_reader_loop(self, peer_ip, peer_sock, peer_name=""):
         disconnect_logged = False
 
         try:
@@ -584,38 +572,35 @@ class P2PChatApp:
                 msg_type, payload = read_message(peer_sock)
 
                 if msg_type == MessageType.CHAT:
-                    actual_name = self.get_peer_name(peer_ip, peer_tcp_port, peer_name)
+                    actual_name = self.get_peer_name(peer_ip, peer_name)
                     self.add_history_event(
                         event_type="incoming_message",
                         peer_ip=peer_ip,
                         peer_name=actual_name,
-                        peer_tcp_port=peer_tcp_port,
                         content=payload
                     )
 
                 elif msg_type == MessageType.DISCONNECT:
-                    actual_name = self.get_peer_name(peer_ip, peer_tcp_port, peer_name)
+                    actual_name = self.get_peer_name(peer_ip, peer_name)
                     self.add_history_event(
                         event_type="peer_disconnected",
                         peer_ip=peer_ip,
-                        peer_name=actual_name,
-                        peer_tcp_port=peer_tcp_port
+                        peer_name=actual_name
                     )
                     disconnect_logged = True
                     break
 
         except (ConnectionError, OSError):
             if self.running:
-                actual_name = self.get_peer_name(peer_ip, peer_tcp_port, peer_name)
+                actual_name = self.get_peer_name(peer_ip, peer_name)
                 self.add_history_event(
                     event_type="peer_disconnected",
                     peer_ip=peer_ip,
-                    peer_name=actual_name,
-                    peer_tcp_port=peer_tcp_port
+                    peer_name=actual_name
                 )
                 disconnect_logged = True
         finally:
-            self.mark_peer_disconnected(peer_ip, peer_tcp_port, emit_event=False)
+            self.mark_peer_disconnected(peer_ip, emit_event=False)
 
             try:
                 peer_sock.shutdown(socket.SHUT_RDWR)
@@ -639,7 +624,7 @@ class P2PChatApp:
                     peer.sock.sendall(create_message(MessageType.CHAT, text))
                     sent_to_anyone = True
                 except OSError:
-                    self.mark_peer_disconnected(peer.ip, peer.tcp_port, emit_event=True)
+                    self.mark_peer_disconnected(peer.ip, emit_event=True)
 
         if sent_to_anyone:
             self.add_history_event(
@@ -722,6 +707,14 @@ class P2PChatApp:
             event_type="system",
             content="Команды: /peers, /rescan, /exit"
         )
+        self.add_history_event(
+            event_type="system",
+            content=f"Порты загружены из {CONFIG_FILE}"
+        )
+        self.add_history_event(
+            event_type="system",
+            content="Важно: у всех узлов должен быть одинаковый TCP-порт из config.json"
+        )
 
         self.send_hello_broadcast()
 
@@ -734,8 +727,7 @@ if __name__ == "__main__":
     local_ips = get_all_local_ipv4()
     bind_ip = choose_ip_interactively(local_ips)
 
-    udp_port = choose_port_interactively("Введите UDP-порт для обнаружения узлов: ")
-    tcp_port = choose_port_interactively("Введите TCP-порт для обмена сообщениями: ")
+    udp_port, tcp_port = load_config()
 
     app = None
     try:

@@ -17,8 +17,7 @@ class MessageType(IntEnum):
     CHAT = 1
     NAME = 2
     HELLO = 3
-    HELLO_ACK = 4
-    DISCONNECT = 5
+    DISCONNECT = 4
 
 
 class Peer:
@@ -218,7 +217,6 @@ class P2PChatApp:
 
         self.running = False
 
-        # key = (peer_ip, peer_tcp_port)
         self.peers = {}
         self.history = []
 
@@ -370,10 +368,6 @@ class P2PChatApp:
         for broadcast_ip in self.broadcast_addresses:
             self.send_udp_packet(broadcast_ip, MessageType.HELLO, payload)
 
-    def send_hello_ack(self, target_ip):
-        payload = self.make_hello_payload()
-        self.send_udp_packet(target_ip, MessageType.HELLO_ACK, payload)
-
     def rescan(self):
         self.add_history_event("system", content="Повторное обнаружение узлов...")
         self.send_hello_broadcast()
@@ -385,8 +379,6 @@ class P2PChatApp:
         if self.is_connected(peer_ip, peer_tcp_port):
             return
 
-        # Один TCP-канал на пару узлов:
-        # инициирует тот, у кого ключ меньше.
         if self.self_key < (peer_ip, peer_tcp_port):
             peer_name = self.get_peer_name(peer_ip, peer_tcp_port)
             self.connect_to_peer(peer_ip, peer_tcp_port, peer_name)
@@ -416,7 +408,7 @@ class P2PChatApp:
             except UnicodeDecodeError:
                 continue
 
-            if msg_type not in (MessageType.HELLO, MessageType.HELLO_ACK):
+            if msg_type != MessageType.HELLO:
                 continue
 
             sender_name, sender_tcp_port = self.parse_hello_payload(payload)
@@ -427,10 +419,6 @@ class P2PChatApp:
                 continue
 
             self.ensure_peer_exists(sender_ip, sender_tcp_port, sender_name)
-
-            if msg_type == MessageType.HELLO:
-                self.send_hello_ack(sender_ip)
-
             self.maybe_connect_by_rule(sender_ip, sender_tcp_port)
 
     def connect_to_peer(self, peer_ip, peer_tcp_port, peer_name=""):
@@ -453,16 +441,18 @@ class P2PChatApp:
             except OSError:
                 pass
 
-            # КРИТИЧНО ДЛЯ LOOPBACK:
-            # явно привязываем исходящее TCP-соединение к IP текущего узла,
-            # иначе Windows может отправить его с 127.0.0.1
             tcp_sock.bind((self.ip, 0))
 
             tcp_sock.settimeout(SOCKET_TIMEOUT)
             tcp_sock.connect((peer_ip, peer_tcp_port))
             tcp_sock.settimeout(None)
 
-            tcp_sock.sendall(create_message(MessageType.NAME, self.name))
+            # Теперь по TCP передаём не только имя, но и listening TCP-порт
+            name_payload = json.dumps({
+                "name": self.name,
+                "tcp_port": self.tcp_port
+            }, ensure_ascii=False)
+            tcp_sock.sendall(create_message(MessageType.NAME, name_payload))
 
             with self.peers_lock:
                 key = self.make_peer_key(peer_ip, peer_tcp_port)
@@ -533,19 +523,20 @@ class P2PChatApp:
                 peer_sock.close()
                 return
 
-            peer_name = payload.strip() or peer_ip
+            # Теперь NAME содержит JSON: {"name": "...", "tcp_port": ...}
+            peer_name, peer_tcp_port = self.parse_hello_payload(payload)
 
-            # TCP-порт удалённого узла берём из уже полученного HELLO,
-            # иначе оставляем None и не принимаем такое соединение.
-            with self.peers_lock:
-                candidates = [p for p in self.peers.values() if p.ip == peer_ip]
-                peer = candidates[0] if candidates else None
-
-            if peer is None or peer.tcp_port is None:
+            if not peer_name or peer_tcp_port is None:
                 peer_sock.close()
                 return
 
-            peer_tcp_port = peer.tcp_port
+            # Если это вдруг соединение от самого себя – игнорируем
+            if (peer_ip, peer_tcp_port) == self.self_key:
+                peer_sock.close()
+                return
+
+            # Даже если мы раньше не видели HELLO от этого узла,
+            # теперь можем создать peer по данным из TCP NAME
             self.ensure_peer_exists(peer_ip, peer_tcp_port, peer_name)
 
             with self.peers_lock:
@@ -636,9 +627,6 @@ class P2PChatApp:
             except OSError:
                 pass
 
-            if not disconnect_logged and not self.running:
-                pass
-
     def broadcast_chat_message(self, text):
         with self.peers_lock:
             peers_copy = list(self.peers.values())
@@ -670,7 +658,6 @@ class P2PChatApp:
         with self.peers_lock:
             peers_copy = list(self.peers.values())
 
-        # Сначала сообщаем об отключении
         for peer in peers_copy:
             if peer.connected and peer.sock is not None:
                 try:
@@ -678,10 +665,8 @@ class P2PChatApp:
                 except OSError:
                     pass
 
-        # Даём данным уйти в сеть
         time.sleep(0.2)
 
-        # Потом мягко закрываем соединения
         for peer in peers_copy:
             if peer.sock is not None:
                 try:

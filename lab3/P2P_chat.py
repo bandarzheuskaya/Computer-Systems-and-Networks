@@ -1,4 +1,3 @@
-import ipaddress
 import json
 import socket
 import struct
@@ -7,14 +6,13 @@ import time
 from datetime import datetime
 from enum import IntEnum
 
-import psutil
-
 
 BUFFER_SIZE = 4096
-HEADER_FORMAT = "!BI"   # 1 byte type, 4 bytes payload length
+HEADER_FORMAT = "!BI"   #1 байт на тип сообщения и 4 для длины нагрузки
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 SOCKET_TIMEOUT = 5.0
 CONFIG_FILE = "config.json"
+DISCOVERY_WAIT_SECONDS = 1.5
 
 
 class MessageType(IntEnum):
@@ -27,23 +25,12 @@ class MessageType(IntEnum):
 
 
 class Peer:
-    def __init__(
-        self,
-        ip,
-        name="",
-        sock=None,
-        connected=False,
-        reader_thread=None
-    ):
+    def __init__(self, ip, name="", sock=None, connected=False, reader_thread=None):
         self.ip = ip
         self.name = name
         self.sock = sock
         self.connected = connected
         self.reader_thread = reader_thread
-
-    @property
-    def key(self):
-        return self.ip
 
 
 class HistoryEvent:
@@ -57,7 +44,7 @@ class HistoryEvent:
     def format_for_display(self):
         peer_suffix = ""
         if self.peer_ip:
-            peer_suffix = f"{self.peer_name} ({self.peer_ip})"
+            peer_suffix = f"{self.peer_name} [{self.peer_ip}]"
 
         if self.event_type == "peer_discovered":
             return f"[{self.timestamp}] [INFO] Обнаружен узел: {peer_suffix}"
@@ -107,7 +94,7 @@ def parse_message_header(header_bytes):
     msg_type, payload_length = struct.unpack(HEADER_FORMAT, header_bytes)
     return MessageType(msg_type), payload_length
 
-
+#Надежно читает байты из TCP соедиения
 def recv_exact(sock, n):
     data = b""
     while len(data) < n:
@@ -128,70 +115,52 @@ def read_message(sock):
 
     return msg_type, payload.decode("utf-8")
 
+# СОбираем возможные айпи адреса компьютера
+def get_all_local_ipv4():
+    ips = set()
 
-def get_all_local_ipv4_with_masks():
-    result = []
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if "." in ip:
+                ips.add(ip)
+    except OSError:
+        pass
 
-    for iface_name, addrs in psutil.net_if_addrs().items():
-        for addr in addrs:
-            if addr.family != socket.AF_INET:
-                continue
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
 
-            ip = addr.address
-            netmask = addr.netmask
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
 
-            if not ip or not netmask:
-                continue
-
-            result.append({
-                "interface": iface_name,
-                "ip": ip,
-                "netmask": netmask
-            })
-
-    unique = []
-    seen = set()
-    for item in result:
-        key = (item["ip"], item["netmask"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-
-    unique.sort(key=lambda x: (x["ip"] != "127.0.0.1", x["ip"]))
-    return unique
+    ips.add("127.0.0.1")
+    return sorted(ips)
 
 
-def choose_ip_interactively(local_infos):
+def choose_ip_interactively(local_ips):
     print("Доступные локальные IPv4-адреса:")
-    for i, info in enumerate(local_infos, start=1):
-        print(
-            f"{i}. {info['ip']} "
-            f"(маска: {info['netmask']}, интерфейс: {info['interface']})"
-        )
-
-    print("Можно ввести номер из списка или IP вручную, например 127.0.0.2")
-    print("При ручном вводе маска будет определяться автоматически, если такой IP найден среди интерфейсов.")
+    for i, ip in enumerate(local_ips, start=1):
+        print(f"{i}. {ip}")
 
     while True:
-        raw = input("Выберите IP для работы чата: ").strip()
+        raw = input("Выберите IP для работы чата или введите вручную: ").strip()
 
         if raw.isdigit():
             idx = int(raw)
-            if 1 <= idx <= len(local_infos):
-                return local_infos[idx - 1]
+            if 1 <= idx <= len(local_ips):
+                return local_ips[idx - 1]
 
         try:
             socket.inet_aton(raw)
-
-            for info in local_infos:
-                if info["ip"] == raw:
-                    return info
-
-            return {
-                "interface": "manual",
-                "ip": raw,
-                "netmask": "255.255.255.0"
-            }
+            return raw
         except OSError:
             print("Неверный ввод. Введите номер из списка или корректный IPv4-адрес.")
 
@@ -214,18 +183,6 @@ def is_port_available(ip, port, sock_type):
 def ensure_port_available(ip, port, sock_type, title):
     if not is_port_available(ip, port, sock_type):
         raise OSError(f"{title}-порт {port} уже занят или недоступен для IP {ip}")
-
-
-def derive_broadcast_addresses(ip, netmask):
-    result = set()
-
-    try:
-        network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
-        result.add(str(network.broadcast_address))
-    except ValueError:
-        pass
-
-    return sorted(result)
 
 
 def load_config():
@@ -252,26 +209,27 @@ def load_config():
 
 
 class P2PChatApp:
-    def __init__(self, name, bind_ip, netmask, udp_port, tcp_port):
+    def __init__(self, name, bind_ip, udp_port, tcp_port):
         self.name = name
         self.ip = bind_ip
-        self.netmask = netmask
         self.udp_port = udp_port
         self.tcp_port = tcp_port
 
-        self.local_infos = get_all_local_ipv4_with_masks()
-        self.broadcast_addresses = derive_broadcast_addresses(self.ip, self.netmask)
+        self.broadcast_addresses = ["255.255.255.255"]
 
         self.running = False
-
         self.peers = {}
         self.history = []
 
         self.peers_lock = threading.Lock()
         self.history_lock = threading.Lock()
+        self.history_request_lock = threading.Lock()
 
         self.udp_socket = None
         self.tcp_server_socket = None
+
+        self.auto_history_requested = False
+        self.auto_history_received = False
 
     def add_history_event(self, event_type, peer_ip="", peer_name="", content=""):
         event = HistoryEvent(
@@ -284,24 +242,18 @@ class P2PChatApp:
             self.history.append(event)
         print(event.format_for_display())
 
-    def validate_not_self_target(self, peer_ip, context):
-        if peer_ip == self.ip:
-            return False
-        return True
+    def validate_not_self_target(self, peer_ip):
+        return peer_ip != self.ip
 
     def ensure_peer_exists(self, peer_ip, peer_name=""):
         discovered_now = False
 
         with self.peers_lock:
             if peer_ip not in self.peers:
-                self.peers[peer_ip] = Peer(
-                    ip=peer_ip,
-                    name=peer_name or peer_ip
-                )
+                self.peers[peer_ip] = Peer(ip=peer_ip, name=peer_name or peer_ip)
                 discovered_now = True
-            else:
-                if peer_name:
-                    self.peers[peer_ip].name = peer_name
+            elif peer_name:
+                self.peers[peer_ip].name = peer_name
 
             current_name = self.peers[peer_ip].name
 
@@ -323,9 +275,10 @@ class P2PChatApp:
         return fallback or peer_ip
 
     def get_peer_by_name(self, peer_name):
+        target = peer_name.casefold()
         with self.peers_lock:
             for peer in self.peers.values():
-                if peer.name == peer_name:
+                if peer.name and peer.name.casefold() == target:
                     return peer
         return None
 
@@ -371,11 +324,13 @@ class P2PChatApp:
         print("Доступные команды:")
         print("/help - показать список команд")
         print("/peers - показать список узлов")
-        print("/rescan - повторно отправить широковещательный HELLO")
-        print("/history <ник> - запросить историю у узла по нику")
-        print("/exit - выйти из чата")
-        print("Любой другой текст отправляется как сообщение в чат")
+        print("/rescan - повторно отправить HELLO")
+        print("/history <ник> - запросить историю")
+        print("/exit - выйти")
+        print("Любой другой текст отправляется в чат")
 
+
+# UDP
     def create_udp_socket(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -383,132 +338,19 @@ class P2PChatApp:
         sock.bind((self.ip, self.udp_port))
         self.udp_socket = sock
 
-    def create_tcp_server_socket(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.ip, self.tcp_port))
-        sock.listen(10)
-        self.tcp_server_socket = sock
-
-    def make_hello_payload(self):
-        return self.name
-
     def send_udp_packet(self, target_ip, msg_type, payload):
         try:
-            self.udp_socket.sendto(
-                create_message(msg_type, payload),
-                (target_ip, self.udp_port)
-            )
-        except OSError as e:
-            self.add_history_event(
-                "warn",
-                content=f"Ошибка отправки UDP на {target_ip}:{self.udp_port} - {e}"
-            )
+            self.udp_socket.sendto(create_message(msg_type, payload), (target_ip, self.udp_port))
+        except OSError:
+            pass
 
     def send_hello_broadcast(self):
-        payload = self.make_hello_payload()
         for broadcast_ip in self.broadcast_addresses:
-            self.send_udp_packet(broadcast_ip, MessageType.HELLO, payload)
+            self.send_udp_packet(broadcast_ip, MessageType.HELLO, self.name)
 
     def rescan(self):
-        self.add_history_event("system", content="Повторное обнаружение узлов...")
+        self.add_history_event("system", content="Повторное обнаружение узлов")
         self.send_hello_broadcast()
-
-    def maybe_connect_by_rule(self, peer_ip):
-        if not self.validate_not_self_target(peer_ip, "попытка TCP-подключения к самому себе"):
-            return
-
-        peer = self.get_peer(peer_ip)
-
-        if peer is not None and not peer.connected:
-            self.connect_to_peer(peer_ip, self.get_peer_name(peer_ip))
-            return
-
-        if self.is_connected(peer_ip):
-            return
-
-        if self.ip < peer_ip:
-            peer_name = self.get_peer_name(peer_ip)
-            self.connect_to_peer(peer_ip, peer_name)
-
-    def request_history_from_peer_name(self, peer_name):
-        peer = self.get_peer_by_name(peer_name)
-        if peer is None:
-            self.add_history_event("warn", content=f"Узел с ником '{peer_name}' не найден")
-            return
-
-        if not peer.connected or peer.sock is None:
-            self.add_history_event("warn", content=f"Узел {peer.name} ({peer.ip}) не подключён")
-            return
-
-        try:
-            peer.sock.sendall(create_message(MessageType.HISTORY_REQUEST, ""))
-            self.add_history_event(
-                event_type="system",
-                content=f"Запрошена история у узла {peer.name} ({peer.ip})"
-            )
-        except OSError as e:
-            self.add_history_event(
-                event_type="warn",
-                content=f"Не удалось запросить историю у {peer.name} ({peer.ip}): {e}"
-            )
-
-    def serialize_history(self):
-        with self.history_lock:
-            return json.dumps([event.to_dict() for event in self.history], ensure_ascii=False)
-
-    def send_history_response(self, peer_sock):
-        payload = self.serialize_history()
-        peer_sock.sendall(create_message(MessageType.HISTORY_RESPONSE, payload))
-
-    def apply_received_history(self, payload, from_ip, from_name):
-        try:
-            raw_events = json.loads(payload)
-            if not isinstance(raw_events, list):
-                raise ValueError("history payload is not a list")
-        except (json.JSONDecodeError, ValueError) as e:
-            self.add_history_event("warn", content=f"Получена некорректная история: {e}")
-            return
-
-        with self.history_lock:
-            existing_keys = {
-                (e.timestamp, e.event_type, e.peer_ip, e.peer_name, e.content)
-                for e in self.history
-            }
-
-        imported_events = []
-        for item in raw_events:
-            try:
-                event = HistoryEvent.from_dict(item)
-            except Exception:
-                continue
-
-            key = (event.timestamp, event.event_type, event.peer_ip, event.peer_name, event.content)
-            if key in existing_keys:
-                continue
-
-            imported_events.append(event)
-            existing_keys.add(key)
-
-        if not imported_events:
-            self.add_history_event(
-                "system",
-                content=f"История от узла {from_name} ({from_ip}) получена, новых записей нет"
-            )
-            return
-
-        with self.history_lock:
-            self.history.extend(imported_events)
-
-        print(f"===== ПОЛУЧЕННАЯ ИСТОРИЯ ОТ {from_name} ({from_ip}) =====")
-        for event in imported_events:
-            print(event.format_for_display())
-        print("===== КОНЕЦ ИСТОРИИ =====")
-
-        self.add_history_event(
-            event_type="system",
-            content=f"Получена история от узла {from_name} ({from_ip}): {len(imported_events)} записей"
-        )
 
     def udp_listener(self):
         while self.running:
@@ -542,14 +384,139 @@ class P2PChatApp:
             if not sender_name:
                 continue
 
-            if not self.validate_not_self_target(sender_ip, "обнаружение собственного HELLO"):
+            if not self.validate_not_self_target(sender_ip):
                 continue
 
             self.ensure_peer_exists(sender_ip, sender_name)
             self.maybe_connect_by_rule(sender_ip)
 
+
+# TCP
+
+    def create_tcp_server_socket(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.ip, self.tcp_port))
+        sock.listen(10)     #backlog
+        self.tcp_server_socket = sock
+
+    # Инициируем только одно TCP соединение между узлами
+    def maybe_connect_by_rule(self, peer_ip):
+        if not self.validate_not_self_target(peer_ip):
+            return
+
+        peer = self.get_peer(peer_ip)
+
+        if peer is not None and not peer.connected:
+            self.connect_to_peer(peer_ip, self.get_peer_name(peer_ip))
+            return
+
+        if self.is_connected(peer_ip):
+            return
+
+        if self.ip < peer_ip:
+            self.connect_to_peer(peer_ip, self.get_peer_name(peer_ip))
+
+
+    #history block
+    def request_history_from_peer_name(self, peer_name):
+        peer = self.get_peer_by_name(peer_name)
+        if peer is None:
+            self.add_history_event("warn", content=f"Узел с ником '{peer_name}' не найден")
+            return
+
+        if not peer.connected or peer.sock is None:
+            self.add_history_event("warn", content=f"Узел {peer.name} ({peer.ip}) не подключён")
+            return
+
+        try:
+            peer.sock.sendall(create_message(MessageType.HISTORY_REQUEST, ""))
+            self.add_history_event("system", content=f"Запрошена история у {peer.name} ({peer.ip})")
+        except OSError as e:
+            self.add_history_event("warn", content=f"Не удалось запросить историю у {peer.name} ({peer.ip}): {e}")
+
+    def serialize_history(self):
+        with self.history_lock:
+            return json.dumps([event.to_dict() for event in self.history], ensure_ascii=False)
+
+    def send_history_response(self, peer_sock):
+        peer_sock.sendall(create_message(MessageType.HISTORY_RESPONSE, self.serialize_history()))
+
+    def apply_received_history(self, payload, from_ip, from_name):
+        try:
+            raw_events = json.loads(payload)
+            if not isinstance(raw_events, list):
+                raise ValueError("history payload is not a list")
+        except (json.JSONDecodeError, ValueError) as e:
+            self.add_history_event("warn", content=f"Получена некорректная история: {e}")
+            return
+
+        imported_events = []
+        for item in raw_events:
+            try:
+                event = HistoryEvent.from_dict(item)
+                imported_events.append(event)
+            except Exception:
+                continue
+
+        if not imported_events:
+            self.auto_history_received = True
+            return
+
+        print(f"===== ПОЛУЧЕННАЯ ИСТОРИЯ ОТ {from_name} ({from_ip}) =====")
+        for event in imported_events:
+            print(event.format_for_display())
+        print("===== КОНЕЦ ИСТОРИИ =====")
+
+        self.auto_history_received = True
+        self.add_history_event(
+            event_type="system",
+            content=f"Получена история от {from_name} ({from_ip}): {len(imported_events)} записей"
+        )
+
+    def initial_discovery_and_history_sync(self):
+        time.sleep(DISCOVERY_WAIT_SECONDS)
+
+        if not self.running:
+            return
+
+        with self.peers_lock:
+            peers_copy = [peer for peer in self.peers.values() if peer.ip != self.ip]
+
+        if not peers_copy:
+            return
+
+        target_peer = peers_copy[0]
+
+        if not target_peer.connected:
+            self.connect_to_peer(target_peer.ip, target_peer.name)
+
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                peer = self.get_peer(target_peer.ip)
+                if peer is not None and peer.connected and peer.sock is not None:
+                    target_peer = peer
+                    break
+                time.sleep(0.1)
+
+        peer = self.get_peer(target_peer.ip)
+        if peer is None or not peer.connected or peer.sock is None:
+            return
+
+        with self.history_request_lock:
+            if self.auto_history_requested or self.auto_history_received:
+                return
+
+            try:
+                peer.sock.sendall(create_message(MessageType.HISTORY_REQUEST, ""))
+                self.auto_history_requested = True
+                self.add_history_event("system", content=f"Автоматически запрошена история у {peer.name} ({peer.ip})")
+            except OSError:
+                pass
+
+
     def connect_to_peer(self, peer_ip, peer_name=""):
-        if not self.validate_not_self_target(peer_ip, "исходящее TCP-подключение к самому себе"):
+        if not self.validate_not_self_target(peer_ip):
             return
 
         with self.peers_lock:
@@ -568,7 +535,6 @@ class P2PChatApp:
                 pass
 
             tcp_sock.bind((self.ip, 0))
-
             tcp_sock.settimeout(SOCKET_TIMEOUT)
             tcp_sock.connect((peer_ip, self.tcp_port))
             tcp_sock.settimeout(None)
@@ -581,12 +547,7 @@ class P2PChatApp:
                     return
 
                 actual_name = peer_name or self.get_peer_name(peer_ip, peer_ip)
-                peer = Peer(
-                    ip=peer_ip,
-                    name=actual_name,
-                    sock=tcp_sock,
-                    connected=True
-                )
+                peer = Peer(ip=peer_ip, name=actual_name, sock=tcp_sock, connected=True)
                 reader_thread = threading.Thread(
                     target=self.peer_reader_loop,
                     args=(peer_ip, tcp_sock, actual_name),
@@ -646,7 +607,7 @@ class P2PChatApp:
                 peer_sock.close()
                 return
 
-            if not self.validate_not_self_target(peer_ip, "входящее TCP-подключение от самого себя"):
+            if not self.validate_not_self_target(peer_ip):
                 try:
                     peer_sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
@@ -691,8 +652,6 @@ class P2PChatApp:
                 pass
 
     def peer_reader_loop(self, peer_ip, peer_sock, peer_name=""):
-        disconnect_logged = False
-
         try:
             while self.running:
                 msg_type, payload = read_message(peer_sock)
@@ -713,15 +672,10 @@ class P2PChatApp:
                         peer_ip=peer_ip,
                         peer_name=actual_name
                     )
-                    disconnect_logged = True
                     break
 
                 elif msg_type == MessageType.HISTORY_REQUEST:
                     self.send_history_response(peer_sock)
-                    self.add_history_event(
-                        event_type="system",
-                        content=f"История отправлена узлу {self.get_peer_name(peer_ip, peer_name)} ({peer_ip})"
-                    )
 
                 elif msg_type == MessageType.HISTORY_RESPONSE:
                     self.apply_received_history(payload, peer_ip, self.get_peer_name(peer_ip, peer_name))
@@ -734,7 +688,6 @@ class P2PChatApp:
                     peer_ip=peer_ip,
                     peer_name=actual_name
                 )
-                disconnect_logged = True
         finally:
             self.mark_peer_disconnected(peer_ip, emit_event=False)
 
@@ -763,15 +716,9 @@ class P2PChatApp:
                     self.mark_peer_disconnected(peer.ip, emit_event=True)
 
         if sent_to_anyone:
-            self.add_history_event(
-                event_type="outgoing_message",
-                content=text
-            )
+            self.add_history_event(event_type="outgoing_message", content=text)
         else:
-            self.add_history_event(
-                event_type="warn",
-                content="Нет подключённых узлов для отправки сообщения"
-            )
+            self.add_history_event(event_type="warn", content="Нет подключённых узлов")
 
     def shutdown(self):
         self.running = False
@@ -827,20 +774,18 @@ class P2PChatApp:
 
         udp_thread = threading.Thread(target=self.udp_listener, daemon=True)
         tcp_thread = threading.Thread(target=self.tcp_listener, daemon=True)
+        sync_thread = threading.Thread(target=self.initial_discovery_and_history_sync, daemon=True)
 
         udp_thread.start()
         tcp_thread.start()
 
         self.add_history_event(
             event_type="system",
-            content=(
-                f"Чат запущен. Имя: {self.name}, IP: {self.ip}, "
-                f"маска: {self.netmask}, broadcast: {', '.join(self.broadcast_addresses)}, "
-                f"UDP: {self.udp_port}, TCP: {self.tcp_port}"
-            )
+            content=f"Чат запущен. Имя: {self.name}, IP: {self.ip}, UDP: {self.udp_port}, TCP: {self.tcp_port}"
         )
 
         self.send_hello_broadcast()
+        sync_thread.start()
 
 
 if __name__ == "__main__":
@@ -848,17 +793,14 @@ if __name__ == "__main__":
     while not user_name:
         user_name = input("Имя не может быть пустым. Введите имя: ").strip()
 
-    local_infos = get_all_local_ipv4_with_masks()
-    bind_info = choose_ip_interactively(local_infos)
-
-    bind_ip = bind_info["ip"]
-    netmask = bind_info["netmask"]
+    local_ips = get_all_local_ipv4()
+    bind_ip = choose_ip_interactively(local_ips)
 
     udp_port, tcp_port = load_config()
 
     app = None
     try:
-        app = P2PChatApp(user_name, bind_ip, netmask, udp_port, tcp_port)
+        app = P2PChatApp(user_name, bind_ip, udp_port, tcp_port)
         app.start()
 
         while True:

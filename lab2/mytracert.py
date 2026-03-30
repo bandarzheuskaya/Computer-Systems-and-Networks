@@ -10,30 +10,26 @@ PROBES_PER_HOP = 3
 TIMEOUT = 3
 
 PRINT_DELAY = 0.3
-HOST_DELAY = 0.4
 
 
 class ICMPPacketCreator:
-    def __init__(self, target_ip, port=None, data=None, ttl=64, icmp_id=ICMP_ID):
-        self.target_ip = target_ip
-        self.port = port
+    def __init__(self, data=None, icmp_id=ICMP_ID):
         self.data = data
-        self.ttl = ttl
         self.icmp_id = icmp_id
 
     def calculate_checksum(self, data):
         checksum = 0
 
-        if len(data) % 2 != 0:
+        if len(data) % 2 != 0:  #если нечетное число байтов добавляем 0
             data += b"\x00"
 
         for i in range(0, len(data), 2):
-            checksum += (data[i] << 8) + data[i + 1]
+            checksum += (data[i] << 8) + data[i + 1]     #собираем из 2 байтов одно число и прибавляем к сумме
 
-        checksum = (checksum >> 16) + (checksum & 0xFFFF)
+        checksum = (checksum >> 16) + (checksum & 0xFFFF)   #если сумма вышла больше 16 бит, перенос из старших битов добавляем обратно
         checksum += checksum >> 16
 
-        return (~checksum) & 0xFFFF
+        return (~checksum) & 0xFFFF  #берем побитовое отрицание результата и оставляем только младшие 16 бит
 
     def create_icmp_packet(self, icmp_sequence):
         icmp_type = 8
@@ -116,22 +112,24 @@ def create_socket(ttl):
 def send_probe(target_ip, ttl, seq):
     s = create_socket(ttl)
     try:
-        pack = ICMPPacketCreator(target_ip, port=None, icmp_id=ICMP_ID).create_icmp_packet(seq)
+        packet = ICMPPacketCreator().create_icmp_packet(seq)
 
         start = perf_counter()
-        s.sendto(pack, (target_ip, 0))
+        s.sendto(packet, (target_ip, 0))
         data, addr = s.recvfrom(65468)
         end = perf_counter()
 
         return data, addr, (end - start) * 1000
+
     except socket.timeout:
         return None, None, None
+
     finally:
         s.close()
 
 
 def parse_icmp_header(data):
-    ip_header_len = (data[0] & 0x0F) * 4
+    ip_header_len = (data[0] & 0x0F) * 4    #data[0] (4 бита IP version 4 бита IHL - зранится в словах по 4 байта)
     icmp_header = data[ip_header_len:ip_header_len + 8]
 
     icmp_type, icmp_code, checksum, packet_id, sequence = struct.unpack("!BBHHH", icmp_header)
@@ -229,8 +227,6 @@ def main():
         print(f"{ttl}".center(7), end='', flush=True)
 
         data, addr, seq, last_seq = trace_hop(target_ip, ttl, seq)
-
-        sleep(HOST_DELAY)
 
         if addr is not None and data is not None and last_seq is not None:
 

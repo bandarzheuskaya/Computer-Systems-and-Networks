@@ -83,7 +83,6 @@ class HistoryEvent:
             timestamp=str(data.get("timestamp", datetime.now().strftime("%H:%M:%S")))
         )
 
-
 def create_message(msg_type, payload_text=""):
     payload = payload_text.encode("utf-8")
     header = struct.pack(HEADER_FORMAT, int(msg_type), len(payload))
@@ -145,30 +144,84 @@ def get_all_local_ipv4():
     return sorted(ips)
 
 
-def choose_ip_interactively(local_ips):
-    print("Доступные локальные IPv4-адреса:")
-    for i, ip in enumerate(local_ips, start=1):
-        print(f"{i}. {ip}")
-
+def choose_ip_interactively(local_ips, udp_port, tcp_port):
     while True:
+        print("Доступные локальные IPv4-адреса:")
+        for i, ip in enumerate(local_ips, start=1):
+            print(f"{i}. {ip}")
+
         raw = input("Выберите IP для работы чата или введите вручную: ").strip()
+
+        chosen_ip = None
 
         if raw.isdigit():
             idx = int(raw)
             if 1 <= idx <= len(local_ips):
-                return local_ips[idx - 1]
+                chosen_ip = local_ips[idx - 1]
+            else:
+                print("Неверный номер из списка.")
+                continue
+        else:
+            try:
+                socket.inet_aton(raw)
+                chosen_ip = raw
+            except OSError:
+                print("Неверный ввод. Введите номер из списка или корректный IPv4-адрес.")
+                continue
 
-        try:
-            socket.inet_aton(raw)
-            return raw
-        except OSError:
-            print("Неверный ввод. Введите номер из списка или корректный IPv4-адрес.")
+        udp_ok = is_port_available(chosen_ip, udp_port, socket.SOCK_DGRAM)
+        tcp_ok = is_port_available(chosen_ip, tcp_port, socket.SOCK_STREAM)
+
+        if udp_ok and tcp_ok:
+            return chosen_ip
+
+        print(
+            f"IP-адрес {chosen_ip} уже используется в чате "
+            f"или для него недоступны порты UDP {udp_port} / TCP {tcp_port}."
+        )
+        print("Выберите другой IP.\n")
+
+def choose_client_port(bind_ip, server_tcp_port):
+    while True:
+        raw = input(
+            "Введите клиентский TCP-порт для исходящих соединений "
+            "(0 - выбрать автоматически): "
+        ).strip()
+
+        if not raw.isdigit():
+            print("Нужно ввести целое число от 1024 до 65535.")
+            continue
+
+        client_port = int(raw)
+
+        if client_port == 0:
+            return 0
+
+        if not (1024 <= client_port <= 65535):
+            print("Порт должен быть в диапазоне 1024..65535.")
+            continue
+
+
+
+        if client_port == server_tcp_port:
+            print(
+                f"Нельзя использовать клиентский порт {client_port}, "
+                f"потому что он совпадает с серверным TCP-портом {server_tcp_port}."
+            )
+            continue
+
+        if not is_port_available(bind_ip, client_port, socket.SOCK_STREAM):
+            print(f"Порт {client_port} уже занят для IP {bind_ip}.")
+            continue
+
+        return client_port
 
 
 def is_port_available(ip, port, sock_type):
     test_sock = socket.socket(socket.AF_INET, sock_type)
     try:
-        test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+
         test_sock.bind((ip, port))
         return True
     except OSError:
@@ -209,11 +262,12 @@ def load_config():
 
 
 class P2PChatApp:
-    def __init__(self, name, bind_ip, udp_port, tcp_port):
+    def __init__(self, name, bind_ip, udp_port, tcp_port, client_port=0):
         self.name = name
         self.ip = bind_ip
         self.udp_port = udp_port
         self.tcp_port = tcp_port
+        self.client_port = client_port
 
         self.broadcast_addresses = ["255.255.255.255"]
 
@@ -333,8 +387,10 @@ class P2PChatApp:
 # UDP
     def create_udp_socket(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((self.ip, self.udp_port))
         self.udp_socket = sock
 
@@ -395,7 +451,9 @@ class P2PChatApp:
 
     def create_tcp_server_socket(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+
         sock.bind((self.ip, self.tcp_port))
         sock.listen(10)     #backlog
         self.tcp_server_socket = sock
@@ -463,7 +521,7 @@ class P2PChatApp:
             self.auto_history_received = True
             return
 
-        print(f"===== ПОЛУЧЕННАЯ ИСТОРИЯ ОТ {from_name} ({from_ip}) =====")
+        print(f"===== ПОЛУЧЕННАЯ ИСТОРИЯ ОТ {from_name} [{from_ip}] =====")
         for event in imported_events:
             print(event.format_for_display())
         print("===== КОНЕЦ ИСТОРИИ =====")
@@ -471,7 +529,7 @@ class P2PChatApp:
         self.auto_history_received = True
         self.add_history_event(
             event_type="system",
-            content=f"Получена история от {from_name} ({from_ip}): {len(imported_events)} записей"
+            content=f"Получена история от {from_name} [{from_ip}]: {len(imported_events)} записей"
         )
 
     def initial_discovery_and_history_sync(self):
@@ -515,6 +573,7 @@ class P2PChatApp:
                 pass
 
 
+# клиент
     def connect_to_peer(self, peer_ip, peer_name=""):
         if not self.validate_not_self_target(peer_ip):
             return
@@ -526,15 +585,8 @@ class P2PChatApp:
         tcp_sock = None
         try:
             tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
-            try:
-                tcp_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except OSError:
-                pass
-
-            tcp_sock.bind((self.ip, 0))
+            tcp_sock.bind((self.ip, self.client_port))
             tcp_sock.settimeout(SOCKET_TIMEOUT)
             tcp_sock.connect((peer_ip, self.tcp_port))
             tcp_sock.settimeout(None)
@@ -576,6 +628,7 @@ class P2PChatApp:
                 content=f"Не удалось подключиться к {peer_name or peer_ip} ({peer_ip}:{self.tcp_port}): {e}"
             )
 
+#сам сервер
     def tcp_listener(self):
         while self.running:
             try:
@@ -651,6 +704,7 @@ class P2PChatApp:
             except OSError:
                 pass
 
+#читает входящие сообщения от конкретного узла
     def peer_reader_loop(self, peer_ip, peer_sock, peer_name=""):
         try:
             while self.running:
@@ -701,6 +755,7 @@ class P2PChatApp:
             except OSError:
                 pass
 
+#рассылка пользовательского ввода по всем tcp соединениям
     def broadcast_chat_message(self, text):
         with self.peers_lock:
             peers_copy = list(self.peers.values())
@@ -781,7 +836,11 @@ class P2PChatApp:
 
         self.add_history_event(
             event_type="system",
-            content=f"Чат запущен. Имя: {self.name}, IP: {self.ip}, UDP: {self.udp_port}, TCP: {self.tcp_port}"
+            content=(
+                f"Чат запущен. Имя: {self.name}, IP: {self.ip}, "
+                f"UDP: {self.udp_port}, TCP: {self.tcp_port}, "
+                f"клиентский TCP-порт: {self.client_port if self.client_port != 0 else 'авто'}"
+            )
         )
 
         self.send_hello_broadcast()
@@ -793,14 +852,16 @@ if __name__ == "__main__":
     while not user_name:
         user_name = input("Имя не может быть пустым. Введите имя: ").strip()
 
-    local_ips = get_all_local_ipv4()
-    bind_ip = choose_ip_interactively(local_ips)
-
     udp_port, tcp_port = load_config()
+
+    local_ips = get_all_local_ipv4()
+    bind_ip = choose_ip_interactively(local_ips, udp_port, tcp_port)
+    client_port = choose_client_port(bind_ip, tcp_port)
+
 
     app = None
     try:
-        app = P2PChatApp(user_name, bind_ip, udp_port, tcp_port)
+        app = P2PChatApp(user_name, bind_ip, udp_port, tcp_port, client_port)
         app.start()
 
         while True:

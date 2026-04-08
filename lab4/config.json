@@ -1,0 +1,12 @@
+{
+  "host": "0.0.0.0",
+  "port": 8080,
+  "blocked_hosts": [
+    "example.org",
+    "badsite.com"
+  ],
+  "blocked_urls": [
+    "http://example.com/test",
+    "http://live.legendy.by:8000/test"
+  ]
+}

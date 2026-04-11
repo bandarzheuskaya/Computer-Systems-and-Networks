@@ -95,14 +95,8 @@ def parse_response_status(response_bytes):
         return None, None
 
 
-def is_blocked(host, target, blocked_hosts, blocked_urls):
-    host = host.lower()
+def is_blocked(target, blocked_urls):
     target = target.lower()
-
-    for blocked_host in blocked_hosts:
-        blocked_host = blocked_host.lower().strip()
-        if host == blocked_host or host.endswith('.' + blocked_host):
-            return True
 
     for blocked_url in blocked_urls:
         blocked_url = blocked_url.lower().strip()
@@ -159,15 +153,18 @@ def forward_request(server_request, host, port, client_socket, target):
 
         first_chunk = server_socket.recv(BUFFER_SIZE)
         if not first_chunk:
-            safe_print(f'{target} – unknown')
+            if not target.endswith('/favicon.ico'):
+                safe_print(f'{target} – unknown')
             return
 
         response_code, response_status = parse_response_status(first_chunk)
 
         if response_code is None:
-            safe_print(f'{target} – unknown')
+            if not target.endswith('/favicon.ico'):
+                safe_print(f'{target} – unknown')
         else:
-            safe_print(f'{target:<60} – {response_code} {response_status}')
+            if not target.endswith('/favicon.ico'):
+                safe_print(f'{target} – {response_code} {response_status}')
 
         client_socket.sendall(first_chunk)
 
@@ -185,7 +182,6 @@ class ProxyServer:
     def __init__(self, config):
         self.host = config.get('host', '127.0.0.1')
         self.port = config.get('port', 8080)
-        self.blocked_hosts = config.get('blocked_hosts', [])
         self.blocked_urls = config.get('blocked_urls', [])
 
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -223,8 +219,9 @@ class ProxyServer:
 
             host, port, path = parsed_url
 
-            if is_blocked(host, target, self.blocked_hosts, self.blocked_urls):
-                safe_print(f'{target:<60} – 403 Forbidden')
+            if is_blocked(target, self.blocked_urls):
+                if not target.endswith('/favicon.ico'):
+                    safe_print(f'{target} – 403 Forbidden')
                 send_blocked_response(client_socket, target)
                 return
 

@@ -1,12 +1,8 @@
 {
-  "host": "0.0.0.0",
+  "host": "127.0.0.2",
   "port": 8080,
-  "blocked_hosts": [
-    "example.org",
-    "badsite.com"
-  ],
-  "blocked_urls": [
-    "http://example.com/test",
-    "http://live.legendy.by:8000/test"
+   "blocked_urls": [
+    "http://live.legendy.by:8000/legendyfm"
   ]
 }
+
